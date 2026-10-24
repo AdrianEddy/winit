@@ -6,6 +6,7 @@ macro_rules! atom_manager {
     ($($name:ident $(:$lit:literal)?),*) => {
         x11rb::atom_manager! {
             /// The atoms used by `winit`
+            #[cfg_attr(test, derive(Default))]
             pub Atoms: AtomsCookie {
                 $($name $(:$lit)?,)*
             }

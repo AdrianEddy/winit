@@ -293,6 +293,98 @@ impl ClipboardState {
             self.types.iter().find(|haystack| haystack.hint() == Some(hint)).cloned()
         }
     }
+
+    /// Decide how to answer another client's request to convert this selection to `target`.
+    ///
+    /// A conversion that cannot be made is refused, which the requestor learns from a
+    /// `SelectionNotify` whose property is `None` (ICCCM, "Responsibilities of the Selection
+    /// Owner").
+    pub(crate) fn plan_conversion(
+        &self,
+        atoms: &Atoms,
+        target: xproto::Atom,
+        incr_threshold: usize,
+    ) -> ReplyPlan {
+        let Some(owned_data) = &self.owned_data else {
+            return ReplyPlan::Refuse;
+        };
+
+        if target == atoms[TARGETS] {
+            // We must advertise at least TIMESTAMP and TARGETS
+            let mut targets = vec![atoms[TIMESTAMP], atoms[TARGETS]];
+
+            // Add user defined types if possible
+            owned_data.for_each_available_type(&mut |ty| {
+                targets.extend(SelectionType::from_dyn(atoms, ty).map(|ty| ty.atom()));
+                core::ops::ControlFlow::Continue(())
+            });
+
+            ReplyPlan::Targets(targets)
+        } else if target == atoms[TIMESTAMP] {
+            ReplyPlan::Timestamp
+        } else {
+            let ty = SelectionType::new(atoms, target);
+            let data = match owned_data.data_for_type(&ty) {
+                Some(SendData::Uris(strings)) => encode_uri_list(strings),
+                Some(SendData::String(str)) => str.into_bytes(),
+                Some(SendData::Bytes(binary)) => binary,
+                Some(send_data) => {
+                    warn!("Unknown send data {send_data:?}");
+                    return ReplyPlan::Refuse;
+                },
+                None => return ReplyPlan::Refuse,
+            };
+
+            if data.len() < incr_threshold {
+                // We can skip using the INCR for short messages.
+                ReplyPlan::Direct(ty, data)
+            } else {
+                ReplyPlan::Incr(ty, data)
+            }
+        }
+    }
+}
+
+/// How the owner of a selection answers the conversion of one target.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReplyPlan {
+    /// Store the list of supported targets, of type `ATOM`.
+    Targets(Vec<xproto::Atom>),
+    /// Store the timestamp used to acquire the selection, of type `INTEGER`.
+    Timestamp,
+    /// Store the data in the property with one request.
+    Direct(SelectionType, Vec<u8>),
+    /// Send the data incrementally, with the `INCR` mechanism.
+    Incr(SelectionType, Vec<u8>),
+    /// Refuse the conversion.
+    Refuse,
+}
+
+/// The property to store the reply to a `SelectionRequest` in.
+///
+/// ICCCM: a request whose property is `None` comes from an obsolete client, and owners are
+/// encouraged to use the target atom as the property name instead.
+pub(crate) fn reply_property(property: xproto::Atom, target: xproto::Atom) -> xproto::Atom {
+    if property == x11rb::NONE { target } else { property }
+}
+
+/// The `SelectionNotify` that answers a `SelectionRequest`.
+///
+/// ICCCM: its requestor, selection, target and time are those of the request, and its property is
+/// the one the reply was stored in, or `None` when the conversion is refused.
+pub(crate) fn selection_notify_reply(
+    request: &XSelectionRequestEvent,
+    property: Option<xproto::Atom>,
+) -> xproto::SelectionNotifyEvent {
+    xproto::SelectionNotifyEvent {
+        response_type: xproto::SELECTION_NOTIFY_EVENT,
+        sequence: 0,
+        time: request.time as _,
+        requestor: request.requestor as _,
+        selection: request.selection as _,
+        target: request.target as _,
+        property: property.unwrap_or(x11rb::NONE),
+    }
 }
 
 #[derive(Debug)]
@@ -590,113 +682,116 @@ impl DataTransferState {
         &mut self.clipboards[clipboard as usize]
     }
 
-    /// Requests to access the clipboard have many properties. Returned true if successfully
-    /// resolved.
-    pub fn attach_clipboard_property(&mut self, xev: &XSelectionRequestEvent) -> bool {
-        let atoms = self.xconn.atoms();
+    /// Answer a `SelectionRequest` from another client, returning the property the reply was
+    /// stored in, or `None` if the conversion is refused.
+    ///
+    /// The caller sends the `SelectionNotify` in both cases (see [`selection_notify_reply`]).
+    pub fn answer_selection_request(
+        &mut self,
+        xev: &XSelectionRequestEvent,
+    ) -> Option<xproto::Atom> {
         // For strange reasons, all the values in the input request are u64 whereas the sending uses
         // a different library with u32s
-        let prop = xev.property as xproto::Atom;
         let target = xev.target as xproto::Atom;
+        let property = reply_property(xev.property as xproto::Atom, target);
         let requestor = xev.requestor as xproto::Window;
 
-        let Some(resolved_clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _)
+        let Some(clipboard) =
+            ClipboardSelectionType::from_atom(self.xconn.atoms(), xev.selection as _)
         else {
-            warn!("Received request for unknown target clipboard {}", self.xconn.atom_str(prop));
-            return false;
-        };
-        let Some(owned_data) = &self.get_clipboard(resolved_clipboard).owned_data else {
-            warn!("Received request for clipboard with no data {:?}", resolved_clipboard);
-            return false;
-        };
-
-        let replace = xproto::PropMode::REPLACE;
-
-        // Choose the handler for the type of selection
-        if target == atoms[TARGETS] as _ {
-            // We must advertise at least TIMESTAMP and TARGETS
-            let mut accepted: Vec<xproto::Atom> = vec![atoms[TIMESTAMP] as _, atoms[TARGETS] as _];
-
-            // Add user defined types if possible
-            owned_data.for_each_available_type(&mut |ty| {
-                accepted.extend(SelectionType::from_dyn(atoms, ty).map(|ty| ty.atom()));
-                core::ops::ControlFlow::Continue(())
-            });
-
-            self.xconn
-                .change_property(requestor, prop, xproto::AtomEnum::ATOM.into(), replace, &accepted)
-                .expect_then_ignore_error("unable to change property to set TARGETS");
-
-            // The names are resolved inside `trace!`, so that the round trip per atom is only made
-            // when trace logging is enabled.
-            trace!(
-                "Written TARGETS {:?} into property {} ",
-                accepted.iter().map(|&atom| self.xconn.atom_str(atom)).collect::<Vec<_>>(),
-                self.xconn.atom_str(prop)
+            warn!(
+                "Received request for unknown selection {}",
+                self.xconn.atom_str(xev.selection as _)
             );
+            return None;
+        };
 
-            true
-        } else if target == atoms[TIMESTAMP] as _ {
-            self.xconn
-                .change_property(requestor, prop, xproto::AtomEnum::INTEGER.into(), replace, &[
-                    CURRENT_TIME,
-                ])
-                .expect_then_ignore_error("unable to change property to set TIMESTAMP");
-            trace!("Written TIMESTAMP into property {} ", self.xconn.atom_str(prop));
+        self.answer_target(requestor, clipboard, target, property).then_some(property)
+    }
 
-            true
-        } else {
-            let ty = SelectionType::new(atoms, target);
-            let Some(send_data) = owned_data.data_for_type(&ty) else {
-                warn!(
-                    "Selection request for unknown selection target {}",
+    /// Convert the selection to `target`, storing the result in `property` on `requestor`.
+    /// Returns whether the conversion was made.
+    fn answer_target(
+        &mut self,
+        requestor: xproto::Window,
+        clipboard: ClipboardSelectionType,
+        target: xproto::Atom,
+        property: xproto::Atom,
+    ) -> bool {
+        let atoms = self.xconn.atoms();
+        let replace = xproto::PropMode::REPLACE;
+        let plan =
+            self.get_clipboard(clipboard).plan_conversion(atoms, target, INCR_CHUNK_SIZE_BYTES);
+
+        let stored = match plan {
+            ReplyPlan::Refuse => {
+                debug!(
+                    "Refusing the conversion of {clipboard:?} to {}",
                     self.xconn.atom_str(target)
                 );
                 return false;
-            };
-            let data = match send_data {
-                SendData::Uris(strings) => encode_uri_list(strings),
-                SendData::String(str) => str.into_bytes(),
-                SendData::Bytes(binary) => binary,
-                _ => {
-                    warn!("Unknown send data {send_data:?}");
-                    return false;
-                },
-            };
-
-            if data.len() < INCR_CHUNK_SIZE_BYTES {
-                // We can skip using the INCR for short messages.
-                self.xconn
-                    .change_property(requestor, prop, ty.atom(), replace, &data)
-                    .expect_then_ignore_error("unable to change property to send clipboard data");
-                trace!(
-                    "Directly written data of type {} into {} ",
-                    self.xconn.atom_str(target),
-                    self.xconn.atom_str(prop)
+            },
+            ReplyPlan::Targets(targets) => {
+                let stored = self.xconn.change_property(
+                    requestor,
+                    property,
+                    xproto::AtomEnum::ATOM.into(),
+                    replace,
+                    &targets,
                 );
-            } else if let Err(e) = self.start_incr_sender(xev, data, ty) {
-                warn!("Unable to start INCR sender {e}");
-                return false;
-            }
-            true
+                // The names are resolved inside `trace!`, so that the round trip per atom is only
+                // made when trace logging is enabled.
+                trace!(
+                    "Written TARGETS {:?} into property {} ",
+                    targets.iter().map(|&atom| self.xconn.atom_str(atom)).collect::<Vec<_>>(),
+                    self.xconn.atom_str(property)
+                );
+                stored
+            },
+            ReplyPlan::Timestamp => self.xconn.change_property(
+                requestor,
+                property,
+                xproto::AtomEnum::INTEGER.into(),
+                replace,
+                &[CURRENT_TIME],
+            ),
+            ReplyPlan::Direct(ty, data) => {
+                self.xconn.change_property(requestor, property, ty.atom(), replace, &data)
+            },
+            ReplyPlan::Incr(ty, data) => {
+                return match self.start_incr_sender(requestor, property, clipboard, data, ty) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!("Unable to start INCR sender {err}");
+                        false
+                    },
+                };
+            },
+        };
+
+        match stored {
+            Ok(cookie) => {
+                cookie.ignore_error();
+                true
+            },
+            Err(err) => {
+                warn!("Unable to store the converted selection: {err}");
+                false
+            },
         }
     }
 
     /// Sets up the sending for the INCR
     fn start_incr_sender(
         &mut self,
-        xev: &XSelectionRequestEvent,
+        requestor: xproto::Window,
+        property: xproto::Atom,
+        clipboard: ClipboardSelectionType,
         data: Vec<u8>,
         ty: SelectionType,
     ) -> Result<(), crate::event_loop::X11Error> {
         let xconn = &self.xconn;
         let atoms = xconn.atoms();
-
-        let property = xev.property as xproto::Atom;
-        let requestor = xev.requestor as xproto::Window;
-        let Some(clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _) else {
-            return Err(X11Error::UnexpectedNull("getting clipboard selection"));
-        };
 
         let current_attributes =
             xconn.xcb_connection().get_window_attributes(requestor)?.reply()?;
@@ -1031,3 +1126,6 @@ impl DataTransferState {
         self.clip_incr_send.retain(|receive| receive.clipboard != clipboard);
     }
 }
+
+#[cfg(test)]
+mod tests;
