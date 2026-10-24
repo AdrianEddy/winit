@@ -441,6 +441,11 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndEnter] as c_ulong {
+            // A drag that never left: its pending fetches will not be answered any more.
+            if let Some((_, abandoned)) = self.target.data_transfer_state.get_mut().end_drag() {
+                self.deliver_data_transfers(abandoned, app);
+            }
+
             // Cautiously limit the scope of the `dnd` lock so we don't rely on `app.window_event`
             // never contending the lock.
             let transfer_id = {
@@ -579,9 +584,7 @@ impl EventProcessor {
 
             let mut dnd = self.target.data_transfer_state.borrow_mut();
 
-            if let Some(state) =
-                dnd.state_mut().filter(|state| !state.pending_fetch_types.is_empty())
-            {
+            if let Some(state) = dnd.state_mut().filter(|state| !state.fetches.is_empty()) {
                 state.finished = Some((window, source_window));
             } else {
                 unsafe {
@@ -595,9 +598,12 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndLeave] as c_ulong {
-            let Some(state) = self.target.data_transfer_state.borrow_mut().reset_state() else {
+            let Some((state, abandoned)) = self.target.data_transfer_state.get_mut().end_drag()
+            else {
                 return;
             };
+            // The fetches still pending are completed before the drag ends.
+            self.deliver_data_transfers(abandoned, app);
             app.window_event(&self.target, window_id, WindowEvent::DragLeft {
                 id: state.transfer_id,
             });
@@ -699,99 +705,8 @@ impl EventProcessor {
     }
 
     fn selection_notify_dnd(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
-        let xwindow = xev.requestor as xproto::Window;
-        let (transfer_id, serial, type_) = {
-            let Some(state) = self.target.data_transfer_state.get_mut().state_mut() else {
-                return;
-            };
-
-            let Some((serial, type_)) = state.pending_fetch_types.pop_front() else {
-                return;
-            };
-
-            // Annoyingly, `xproto::Atom` and `x11_dl::Atom` are different on 64-bit
-            // but the same on 32-bit, so just casting to `u32` will cause "casting
-            // to same type" clippy warnings when compiled as 32-bit.
-            #[cfg(target_pointer_width = "32")]
-            let target_type = xev.target;
-            #[cfg(target_pointer_width = "64")]
-            let target_type = xev.target as u32;
-
-            if target_type != type_.atom() {
-                let get_name = |atom| {
-                    self.target
-                        .xconn
-                        .xcb_connection()
-                        .get_atom_name(atom)
-                        .ok()
-                        .and_then(|cookie| cookie.reply().ok())
-                        .and_then(|reply| String::from_utf8(reply.name).ok())
-                };
-
-                let expected_type_name = get_name(type_.atom());
-                let found_type_name = get_name(xev.type_ as _);
-
-                let extra_context = match (expected_type_name, found_type_name) {
-                    (Some(expected), Some(found)) => {
-                        format!(" (expected {expected}, found {found})")
-                    },
-                    (Some(expected), None) => format!(" (expected {expected})"),
-                    (None, Some(found)) => format!(" (found {found})"),
-                    (None, None) => "".to_string(),
-                };
-                warn!(
-                    "Received `SelectionNotify` with unexpected type{extra_context}. Continuing, \
-                     but this may be a bug."
-                );
-            }
-
-            (state.transfer_id, serial, type_)
-        };
-
-        let value = match self.target.data_transfer_state.borrow().read_data(xwindow, type_) {
-            Ok(value) => Arc::new(value),
-            Err(err) => {
-                warn!("Failed to read selection: {err}");
-                return;
-            },
-        };
-
-        let window_id = mkwid(xwindow);
-
-        app.window_event(&self.target, window_id, WindowEvent::DataTransferReceived {
-            id: transfer_id,
-            serial,
-            value,
-        });
-
-        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
-
-        // If we have another fetch pending, request it from the drag source window
-        if let Some((window, type_)) = data_transfer.state().and_then(|state| {
-            state
-                .pending_fetch_types
-                .front()
-                .cloned()
-                .map(|(_, type_)| (state.target_window, type_))
-        }) {
-            let selection = self.target.xconn.atoms()[XdndSelection];
-            // TODO: The result is stored into a property named XdndSelection. Consider using a
-            // different name to avoid conflict.
-            if let Err(err) =
-                self.target.xconn.convert_selection(window, selection, type_.atom(), selection)
-            {
-                error!("Could not convert the dropped selection: {err}");
-            }
-        } else if let Some((this_window, target_window)) =
-            data_transfer.state().and_then(|state| state.finished)
-        {
-            unsafe {
-                data_transfer
-                    .send_finished(this_window, target_window)
-                    .expect("Failed to send `XdndFinished` message.");
-            }
-            data_transfer.reset_state();
-        }
+        let finished = self.target.data_transfer_state.get_mut().drag_reply(xev);
+        self.deliver_data_transfers(finished, app);
     }
 
     /// Data received from another application

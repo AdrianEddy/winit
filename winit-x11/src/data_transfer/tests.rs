@@ -460,3 +460,54 @@ fn every_fetch_ends_in_exactly_one_result() {
 
     assert_eq!(results.iter().map(|finished| finished.serial).collect::<Vec<_>>(), serials);
 }
+
+/// A drag of data dropped on window 5 by the source window 6, with one fetch outstanding.
+fn dropped_drag_with_a_fetch() -> DragState {
+    let mut drag = DragState { target_window: 5, finished: Some((5, 6)), ..Default::default() };
+    drag.fetches.push(pending(drag.transfer_id, 5, Some(request(1, 10))));
+    drag
+}
+
+#[test]
+fn a_drop_is_finished_once_its_last_fetch_completes() {
+    let mut drag = dropped_drag_with_a_fetch();
+    assert_eq!(drag.drop_to_finish(), None, "a fetch is outstanding");
+
+    let finished = drag.complete_fetch(Ok(b"file:///tmp/a".to_vec())).expect("a fetch is pending");
+
+    assert_eq!(finished.id, drag.transfer_id);
+    assert_eq!(finished.window(), WindowId::from_raw(5));
+    assert_eq!(drag.drop_to_finish(), Some((5, 6)));
+}
+
+#[test]
+fn a_drop_is_finished_when_its_last_fetch_fails() {
+    let mut drag = dropped_drag_with_a_fetch();
+
+    let refused = io::Error::new(io::ErrorKind::Unsupported, "refused");
+    let finished = drag.complete_fetch(Err(refused)).expect("the failed fetch is completed");
+
+    assert_eq!(error_kind(&finished), Some(io::ErrorKind::Unsupported));
+    assert_eq!(drag.drop_to_finish(), Some((5, 6)));
+}
+
+#[test]
+fn a_drag_that_was_not_dropped_is_not_finished() {
+    let mut drag = DragState { target_window: 5, ..Default::default() };
+    drag.fetches.push(pending(drag.transfer_id, 5, Some(request(1, 10))));
+
+    let _ = drag.complete_fetch(Ok(Vec::new()));
+
+    assert_eq!(drag.drop_to_finish(), None);
+}
+
+#[test]
+fn a_reply_to_an_earlier_drag_does_not_answer_the_current_one() {
+    let drag = dropped_drag_with_a_fetch();
+    let (ty, request) = drag.fetches.front_request().expect("a conversion is outstanding");
+    let expected = |target| target == ty.atom();
+
+    assert!(!request.answered_by(expected, 2, UTF8_STRING_ATOM, 30), "another property");
+    assert!(!request.answered_by(expected, x11rb::NONE, UTF8_STRING_ATOM, 9), "refused earlier");
+    assert!(request.answered_by(expected, 1, UTF8_STRING_ATOM, 30));
+}
