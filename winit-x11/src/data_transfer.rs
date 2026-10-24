@@ -310,8 +310,9 @@ impl ClipboardState {
         };
 
         if target == atoms[TARGETS] {
-            // We must advertise at least TIMESTAMP and TARGETS
-            let mut targets = vec![atoms[TIMESTAMP], atoms[TARGETS]];
+            // We must advertise at least TIMESTAMP, TARGETS and MULTIPLE, which ICCCM requires
+            // every owner to support.
+            let mut targets = vec![atoms[TIMESTAMP], atoms[TARGETS], atoms[MULTIPLE]];
 
             // Add user defined types if possible
             owned_data.for_each_available_type(&mut |ty| {
@@ -366,6 +367,33 @@ pub(crate) enum ReplyPlan {
 /// encouraged to use the target atom as the property name instead.
 pub(crate) fn reply_property(property: xproto::Atom, target: xproto::Atom) -> xproto::Atom {
     if property == x11rb::NONE { target } else { property }
+}
+
+/// Answer the conversions listed by a `MULTIPLE` request: `pairs` holds `(target, property)` atom
+/// pairs, and `answer` converts one of them, returning whether it succeeded.
+///
+/// ICCCM: the pairs are converted in order, as if each were a separate request; a pair whose
+/// property is `None` is not valid; and the property of every pair that could not be converted is
+/// replaced by `None`. Returns that rewritten list when some conversion failed, so the caller can
+/// store it back, or `None` when all of them succeeded. A trailing unpaired atom is ignored, and
+/// `MULTIPLE` itself is not converted inside a `MULTIPLE` request.
+pub(crate) fn answer_multiple(
+    pairs: &[xproto::Atom],
+    multiple: xproto::Atom,
+    mut answer: impl FnMut(xproto::Atom, xproto::Atom) -> bool,
+) -> Option<Vec<xproto::Atom>> {
+    let pairs = &pairs[..pairs.len() / 2 * 2];
+    let mut rewritten: Option<Vec<xproto::Atom>> = None;
+
+    for (index, pair) in pairs.chunks_exact(2).enumerate() {
+        let (target, property) = (pair[0], pair[1]);
+        let converted = property != x11rb::NONE && target != multiple && answer(target, property);
+        if !converted {
+            rewritten.get_or_insert_with(|| pairs.to_vec())[index * 2 + 1] = x11rb::NONE;
+        }
+    }
+
+    rewritten
 }
 
 /// The `SelectionNotify` that answers a `SelectionRequest`.
@@ -706,7 +734,55 @@ impl DataTransferState {
             return None;
         };
 
+        if target == self.xconn.atoms()[MULTIPLE] {
+            // ICCCM: MULTIPLE is valid only when a property is specified.
+            if xev.property as xproto::Atom == x11rb::NONE {
+                return None;
+            }
+            return self
+                .answer_multiple_request(requestor, clipboard, property)
+                .then_some(property);
+        }
+
         self.answer_target(requestor, clipboard, target, property).then_some(property)
+    }
+
+    /// Answer a `MULTIPLE` request, whose property on `requestor` lists the `(target, property)`
+    /// pairs to convert. Returns whether the list could be read.
+    fn answer_multiple_request(
+        &mut self,
+        requestor: xproto::Window,
+        clipboard: ClipboardSelectionType,
+        property: xproto::Atom,
+    ) -> bool {
+        let atoms = self.xconn.atoms();
+        let (atom_pair, multiple) = (atoms[ATOM_PAIR], atoms[MULTIPLE]);
+        let pairs = match self.xconn.get_property::<u32>(requestor, property, atom_pair) {
+            Ok(pairs) => pairs,
+            Err(err) => {
+                debug!("Refusing MULTIPLE, could not read its list of conversions: {err}");
+                return false;
+            },
+        };
+
+        let failed = answer_multiple(&pairs, multiple, |target, property| {
+            self.answer_target(requestor, clipboard, target, property)
+        });
+
+        if let Some(rewritten) = failed {
+            match self.xconn.change_property(
+                requestor,
+                property,
+                atom_pair,
+                xproto::PropMode::REPLACE,
+                &rewritten,
+            ) {
+                Ok(cookie) => cookie.ignore_error(),
+                Err(err) => warn!("Unable to report the failed conversions of MULTIPLE: {err}"),
+            }
+        }
+
+        true
     }
 
     /// Convert the selection to `target`, storing the result in `property` on `requestor`.
