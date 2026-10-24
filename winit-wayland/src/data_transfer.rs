@@ -32,7 +32,7 @@ use sctk::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_
 use sctk::shell::WaylandSurface;
 use wayland_client::protocol::wl_data_device::WlDataDevice;
 use wayland_client::protocol::wl_data_device_manager::DndAction as WlDndAction;
-use wayland_client::protocol::wl_data_offer::WlDataOffer;
+use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_client::protocol::wl_data_source::WlDataSource;
 use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -322,6 +322,9 @@ impl TypedData for MimeData {
 pub struct DataOffer {
     mime_types: Arc<[MimeType]>,
     transfer_id: DataTransferId,
+    /// The actions that the source of a drag allows, as it last reported them; `None` for an
+    /// offer that is not a drag, or that does not report them.
+    source_actions: Option<WlDndAction>,
 }
 
 impl DataOffer {
@@ -329,7 +332,30 @@ impl DataOffer {
         Self {
             mime_types: mime_types.iter().map(|mime| MimeType::parse(mime.clone())).collect(),
             transfer_id,
+            source_actions: None,
         }
+    }
+
+    /// The offer of a drag, made through a `wl_data_offer` of version `offer_version`, whose
+    /// source allows `source_actions`. Offers before version 3 do not report the source actions,
+    /// which then remain unknown.
+    fn dragged(mut self, offer_version: u32, source_actions: WlDndAction) -> Self {
+        if offer_version >= wl_data_offer::EVT_SOURCE_ACTIONS_SINCE {
+            self.source_actions = Some(source_actions);
+        }
+        self
+    }
+
+    /// The source of the drag offered now allows `source_actions`, as the
+    /// `wl_data_offer.source_actions` event (of offers of version 3 and later) reports.
+    fn set_source_actions(&mut self, source_actions: WlDndAction) {
+        self.source_actions = Some(source_actions);
+    }
+
+    /// The actions to negotiate with the source of the drag offered: none if they are unknown,
+    /// which is also what an offer before version 3 negotiates with.
+    fn actions_allowed_by_source(&self) -> WlDndAction {
+        self.source_actions.unwrap_or(WlDndAction::empty())
     }
 
     fn transfer_id(&self) -> DataTransferId {
@@ -359,6 +385,10 @@ impl DataTransfer for DataOffer {
         func: &'_ mut dyn FnMut(&'this dyn TransferType) -> std::ops::ControlFlow<()>,
     ) {
         let _ = self.mime_types.iter().map(|mime| mime as &dyn TransferType).try_for_each(func);
+    }
+
+    fn source_actions(&self) -> Option<&[DndAction]> {
+        self.source_actions.map(dnd_actions_wl_to_winit)
     }
 }
 
@@ -889,6 +919,23 @@ fn dnd_action_wl_to_winit(wl: WlDndAction) -> Option<DndAction> {
     }
 }
 
+/// The actions of a set of `wl_data_device_manager.dnd_action` flags.
+fn dnd_actions_wl_to_winit(wl: WlDndAction) -> &'static [DndAction] {
+    use DndAction::{Ask, Copy, Move};
+
+    let flag = |action| wl.contains(action);
+    match (flag(WlDndAction::Move), flag(WlDndAction::Copy), flag(WlDndAction::Ask)) {
+        (false, false, false) => &[],
+        (true, false, false) => &[Move],
+        (false, true, false) => &[Copy],
+        (false, false, true) => &[Ask],
+        (true, true, false) => &[Move, Copy],
+        (true, false, true) => &[Move, Ask],
+        (false, true, true) => &[Copy, Ask],
+        (true, true, true) => &[Move, Copy, Ask],
+    }
+}
+
 #[derive(Debug)]
 struct OfferHandle {
     data: WlDataOffer,
@@ -906,9 +953,9 @@ impl Deref for OfferHandle {
 #[derive(Debug)]
 struct DragSession {
     offer: OfferHandle,
+    /// The data offered, and the actions its source allows.
     data: DataOffer,
     window_id: WindowId,
-    source_actions: WlDndAction,
     selected_action: WlDndAction,
     accepted: bool,
     fetches: HashSet<AsyncRequestSerial>,
@@ -923,17 +970,11 @@ enum Phase {
 }
 
 impl DragSession {
-    fn new(
-        offer: OfferHandle,
-        data: DataOffer,
-        window_id: WindowId,
-        source_actions: WlDndAction,
-    ) -> Self {
+    fn new(offer: OfferHandle, data: DataOffer, window_id: WindowId) -> Self {
         Self {
             offer,
             data,
             window_id,
-            source_actions,
             selected_action: WlDndAction::empty(),
             accepted: false,
             fetches: HashSet::default(),
@@ -956,9 +997,10 @@ impl DragSession {
     }
 
     fn set_actions(&mut self, action_set: &[DndAction]) {
+        let source_actions = self.data.actions_allowed_by_source();
         let preferred_action = action_set.iter().find_map(|winit| {
             let wl = dnd_action_winit_to_wl(*winit);
-            self.source_actions.intersects(wl).then_some(wl)
+            source_actions.intersects(wl).then_some(wl)
         });
 
         let all_actions = action_set
@@ -1177,7 +1219,7 @@ impl DataOfferHandler for WinitState {
             .values_mut()
             .find(|session| session.offer.data == *offer.inner())
         {
-            session.source_actions = actions;
+            session.data.set_source_actions(actions);
         }
     }
 
@@ -1220,14 +1262,16 @@ impl DataDeviceHandler for WinitState {
         let device = data_device.id();
         let window_id = crate::make_wid(wl_surface);
 
-        let view = drag.with_mime_types(|types| {
-            DataOffer::new(types, make_data_transfer_id(device.clone(), drag.serial))
-        });
+        let view = drag
+            .with_mime_types(|types| {
+                DataOffer::new(types, make_data_transfer_id(device.clone(), drag.serial))
+            })
+            .dragged(drag.inner().version(), drag.source_actions);
         let offer = OfferHandle { data: drag.inner().clone(), serial: drag.serial };
 
         let id = view.transfer_id();
 
-        let mut session = DragSession::new(offer, view, window_id, drag.source_actions);
+        let mut session = DragSession::new(offer, view, window_id);
         session.set_actions(&[]);
 
         if let Some(old) = self.data_transfer_state.drags.insert(device, session) {

@@ -64,3 +64,68 @@ fn a_new_drag_ends_an_earlier_drag_that_was_never_dropped() {
     assert_eq!(drags.take(|drag| drag.id == 3), Some(test_drag(3, false)));
     assert_eq!(drags.take(|drag| drag.id == 2), None);
 }
+
+fn text_offer() -> DataOffer {
+    DataOffer::new(&["text/plain".to_owned()], DataTransferId::from_raw(1))
+}
+
+/// The source actions of a data transfer, as the application sees them.
+fn source_actions(offer: &DataOffer) -> Option<Vec<DndAction>> {
+    let transfer: Box<dyn DataTransfer> = Box::new(offer.clone());
+    transfer.source_actions().map(<[DndAction]>::to_vec)
+}
+
+/// A drag offered at version 3 or later reports each action its source allows.
+#[test]
+fn a_drag_reports_the_actions_its_source_allows() {
+    let (copy, move_, ask) = (WlDndAction::Copy, WlDndAction::Move, WlDndAction::Ask);
+    let reported = |actions| source_actions(&text_offer().dragged(3, actions));
+
+    assert_eq!(reported(copy), Some(vec![DndAction::Copy]));
+    assert_eq!(reported(move_), Some(vec![DndAction::Move]));
+    assert_eq!(reported(ask), Some(vec![DndAction::Ask]));
+    assert_eq!(reported(copy | move_), Some(vec![DndAction::Move, DndAction::Copy]));
+    assert_eq!(reported(copy | ask), Some(vec![DndAction::Copy, DndAction::Ask]));
+    assert_eq!(reported(move_ | ask), Some(vec![DndAction::Move, DndAction::Ask]));
+    let all = Some(vec![DndAction::Move, DndAction::Copy, DndAction::Ask]);
+    assert_eq!(reported(copy | move_ | ask), all);
+    assert_eq!(source_actions(&text_offer().dragged(4, copy)), Some(vec![DndAction::Copy]));
+}
+
+/// A source that allows no action reports an empty set, which is known, rather than an unknown
+/// one.
+#[test]
+fn a_drag_whose_source_allows_nothing_reports_an_empty_set() {
+    let offer = text_offer().dragged(3, WlDndAction::empty());
+    assert_eq!(source_actions(&offer), Some(vec![]));
+}
+
+/// An offer before version 3 does not report the source actions, which are unknown; the target
+/// negotiates with none, as before.
+#[test]
+fn a_drag_offered_before_version_3_has_unknown_source_actions() {
+    let offer = text_offer().dragged(2, WlDndAction::Copy | WlDndAction::Move);
+    assert_eq!(source_actions(&offer), None);
+    assert_eq!(offer.actions_allowed_by_source(), WlDndAction::empty());
+}
+
+/// The source actions of an offer that is not a drag, such as the clipboard's, are unknown.
+#[test]
+fn an_offer_that_is_not_a_drag_has_unknown_source_actions() {
+    assert_eq!(source_actions(&text_offer()), None);
+}
+
+/// The source changes the actions it allows during the drag: a data transfer obtained after the
+/// `source_actions` event sees the change, one obtained before keeps its snapshot, and the
+/// actions negotiated with the target are taken from the new set.
+#[test]
+fn a_change_of_the_source_actions_shows_in_a_new_snapshot() {
+    let mut offer = text_offer().dragged(3, WlDndAction::Copy);
+    let before: Box<dyn DataTransfer> = Box::new(offer.clone());
+
+    offer.set_source_actions(WlDndAction::Copy | WlDndAction::Move);
+
+    assert_eq!(source_actions(&offer), Some(vec![DndAction::Move, DndAction::Copy]));
+    assert_eq!(before.source_actions(), Some(&[DndAction::Copy][..]));
+    assert_eq!(offer.actions_allowed_by_source(), WlDndAction::Copy | WlDndAction::Move);
+}

@@ -103,6 +103,8 @@ use std::any::Any;
 use std::ops::ControlFlow;
 use std::{fmt, io};
 
+use crate::event_loop::DndAction;
+
 /// Unique identifier for a data transfer.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DataTransferId(i64);
@@ -329,6 +331,30 @@ pub trait DataTransfer: Any + fmt::Debug {
         });
 
         found
+    }
+
+    /// The actions that the source of an incoming drag allows, in no particular order, or `None`
+    /// if they are not available: this is not implemented on this platform (yet), the platform
+    /// does not report them for this drag (Wayland before version 3), or this data transfer is not
+    /// an incoming drag. An empty set means that the source allows no action, so that no drop can
+    /// succeed.
+    ///
+    /// An application can choose among them the actions it passes to
+    /// [`ActiveEventLoop::set_valid_dnd_actions`](crate::event_loop::ActiveEventLoop::set_valid_dnd_actions),
+    /// as a drop succeeds only with an action that both sides allow.
+    ///
+    /// The source can change the actions it allows while the drag is in progress. This is the set
+    /// as of when this `DataTransfer` was obtained with
+    /// [`ActiveEventLoop::data_transfer`](crate::event_loop::ActiveEventLoop::data_transfer):
+    /// obtain it again to see a later change.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **Wayland:** The actions that `wl_data_offer.source_actions` last reported; `None` for an
+    ///   offer of a version before 3, which does not report them.
+    /// - **Other platforms:** Always `None`, as this is not implemented there yet.
+    fn source_actions(&self) -> Option<&[DndAction]> {
+        None
     }
 }
 
