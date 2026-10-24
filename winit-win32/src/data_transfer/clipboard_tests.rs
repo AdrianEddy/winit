@@ -15,6 +15,38 @@ fn html_fragment(buf: &[u8]) -> &str {
     std::str::from_utf8(&buf[start..end]).unwrap()
 }
 
+/// Runs `retry_while_clipboard_busy` with attempts that return `results` in turn, repeating the
+/// last one, and returns its result with the number of attempts and of waits.
+fn retry(results: &[HRESULT]) -> (HRESULT, usize, usize) {
+    let mut attempts = 0;
+    let mut waits = 0;
+    let hr = retry_while_clipboard_busy(
+        || {
+            attempts += 1;
+            results[(attempts - 1).min(results.len() - 1)]
+        },
+        || waits += 1,
+    );
+    (hr, attempts, waits)
+}
+
+#[test]
+fn a_busy_clipboard_is_retried_until_it_opens() {
+    let busy = CLIPBRD_E_CANT_OPEN;
+    assert_eq!(retry(&[busy, busy, S_OK]), (S_OK, 3, 2));
+}
+
+#[test]
+fn a_busy_clipboard_is_given_up_after_five_attempts() {
+    assert_eq!(retry(&[CLIPBRD_E_CANT_OPEN]), (CLIPBRD_E_CANT_OPEN, 5, 4));
+}
+
+#[test]
+fn other_results_are_returned_at_once() {
+    assert_eq!(retry(&[S_OK]), (S_OK, 1, 0));
+    assert_eq!(retry(&[E_FAIL, S_OK]), (E_FAIL, 1, 0));
+}
+
 #[test]
 fn html_with_a_start_marker_but_no_end_marker_is_wrapped() {
     let html = "<p>a</p><!--StartFragment--><p>b</p>";

@@ -91,6 +91,7 @@ use super::window::set_skip_taskbar;
 use crate::dark_mode::try_theme;
 use crate::data_transfer::{
     DropSource, FileDropHandler, SourceDataObject, WinDataTransfer, WinTypedData,
+    retry_while_clipboard_busy, wait_for_clipboard,
 };
 use crate::dpi::{become_dpi_aware, dpi_to_scale_factor};
 use crate::event_loop::runner::PendingDrag;
@@ -576,7 +577,10 @@ impl RootActiveEventLoop for ActiveEventLoop {
         crate::data_transfer::ensure_ole_initialized().map_err(|err| os_error!(err))?;
 
         let data_object = SourceDataObject::new(send_data);
-        let hr = unsafe { OleSetClipboard(data_object.interface_ptr()) };
+        let hr = retry_while_clipboard_busy(
+            || unsafe { OleSetClipboard(data_object.interface_ptr()) },
+            wait_for_clipboard,
+        );
         if hr != S_OK {
             return Err(os_error!(format!("OleSetClipboard failed: 0x{hr:08x}")).into());
         }

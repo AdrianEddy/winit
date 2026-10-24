@@ -111,7 +111,11 @@ impl StgMedium {
 
         let mut medium = unsafe { std::mem::zeroed::<STGMEDIUM>() };
         let get_data = unsafe { (*(*data_obj).cast::<IDataObjectVtbl>()).GetData };
-        match unsafe { get_data(data_obj as *mut _, &format, &mut medium) } {
+        let hr = retry_while_clipboard_busy(
+            || unsafe { get_data(data_obj as *mut _, &format, &mut medium) },
+            wait_for_clipboard,
+        );
+        match hr {
             CLIPBRD_E_CANT_OPEN => Err(CLIPBRD_E_CANT_OPEN),
             hr if hr < 0 => Ok(None),
             _ => Ok(Some(Self(medium))),
@@ -850,11 +854,41 @@ pub(crate) fn ensure_ole_initialized() -> Result<(), OleInitError> {
     Ok(())
 }
 
+/// How many times an OLE clipboard call is made while another process holds the clipboard open.
+const CLIPBOARD_ATTEMPTS: usize = 5;
+
+/// Makes `attempt`, an OLE clipboard call, until it returns anything but `CLIPBRD_E_CANT_OPEN`,
+/// at most [`CLIPBOARD_ATTEMPTS`] times, calling `wait` between two attempts.
+///
+/// The OLE clipboard functions open the clipboard, and fail with `CLIPBRD_E_CANT_OPEN` while
+/// another process has it open, as clipboard managers and remote desktop clients briefly do
+/// whenever it changes. Calls are therefore retried for a short while before failing.
+pub(crate) fn retry_while_clipboard_busy(
+    mut attempt: impl FnMut() -> HRESULT,
+    mut wait: impl FnMut(),
+) -> HRESULT {
+    let mut hr = attempt();
+    for _ in 1..CLIPBOARD_ATTEMPTS {
+        if hr != CLIPBRD_E_CANT_OPEN {
+            break;
+        }
+        wait();
+        hr = attempt();
+    }
+    hr
+}
+
+/// The wait between two attempts of [`retry_while_clipboard_busy`].
+pub(crate) fn wait_for_clipboard() {
+    thread::sleep(Duration::from_millis(10));
+}
+
 fn snapshot_clipboard() -> Result<DataObject, TransferError> {
     ensure_ole_initialized().map_err(|err| os_error!(err))?;
 
     let mut ptr: *mut c_void = std::ptr::null_mut();
-    let hr = unsafe { OleGetClipboard(&mut ptr) };
+    let hr =
+        retry_while_clipboard_busy(|| unsafe { OleGetClipboard(&mut ptr) }, wait_for_clipboard);
     if hr != S_OK || ptr.is_null() {
         return Err(os_error!(format!("OleGetClipboard failed: 0x{hr:08x}")).into());
     }
@@ -1006,15 +1040,7 @@ impl DataTransferState {
             return;
         }
 
-        let mut hr = unsafe { OleFlushClipboard() };
-        for _ in 0..4 {
-            if hr != CLIPBRD_E_CANT_OPEN {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-            hr = unsafe { OleFlushClipboard() };
-        }
-
+        let hr = retry_while_clipboard_busy(|| unsafe { OleFlushClipboard() }, wait_for_clipboard);
         if hr != S_OK {
             tracing::warn!("Failed to flush clipboard: 0x{hr:08x}");
         }
