@@ -4,6 +4,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, HWND_MESSAGE}
 use winit_core::data_transfer::DataTransferSendBuilder;
 
 use super::*;
+use crate::clipboard_format::html_clipboard_document;
 
 mod delay_render;
 mod drop_target;
@@ -266,6 +267,15 @@ fn html_with_its_own_fragment_markers_is_kept_as_is() {
     let [start_html, end_html, ..] = html_offsets(&buf);
     assert_eq!(&buf[start_html..end_html], html.as_bytes());
     assert_eq!(html_fragment(&buf), "<b>y</b>");
+}
+
+#[test]
+fn html_built_for_the_clipboard_reads_back_as_its_document() {
+    let buf = build_html_clipboard_format("<b>y</b>");
+    let document = std::str::from_utf8(html_clipboard_document(&buf).unwrap()).unwrap();
+    let wrapped =
+        "<html><body>\r\n<!--StartFragment--><b>y</b><!--EndFragment-->\r\n</body></html>";
+    assert_eq!(document, wrapped);
 }
 
 #[test]

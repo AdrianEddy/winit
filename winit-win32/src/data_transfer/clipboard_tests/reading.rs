@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use windows_sys::Win32::Foundation::{
-    E_FAIL, E_NOTIMPL, OLE_S_USEREG, RPC_E_CALL_REJECTED, RPC_E_DISCONNECTED,
+    CLIPBRD_E_CANT_OPEN, E_FAIL, E_NOTIMPL, OLE_S_USEREG, RPC_E_CALL_REJECTED, RPC_E_DISCONNECTED,
 };
-use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::Globalization::GetACP;
+use windows_sys::Win32::System::Ole::{CF_HDROP, CF_LOCALE, CF_TEXT, CF_UNICODETEXT};
 use winit_core::data_transfer::{TransferType, TypeHint, TypedData};
 use winit_core::error::TransferError;
 use winit_core::window::WindowId;
@@ -17,7 +18,7 @@ use super::test_source::{Listing, Medium, TestSource, utf16_text};
 use super::{DRAG, PNG, SameThread, state_is_free};
 use crate::clipboard_format::ClipboardFormat;
 use crate::data_transfer::{
-    DataTransferState, MAX_LISTINGS, ensure_ole_initialized, enumerate_listings,
+    CLIPBOARD_ATTEMPTS, DataTransferState, MAX_LISTINGS, ensure_ole_initialized, enumerate_listings,
 };
 
 fn png_id() -> u16 {
@@ -185,4 +186,50 @@ fn no_call_reaches_the_data_object_of_a_drag_while_the_state_is_borrowed() {
             assert!(made_it, "{listing:?}: no {call} in {made:?}");
         }
     }
+}
+
+#[test]
+fn code_page_text_is_read_in_the_code_page_of_the_source_locale() {
+    // Text in the ANSI code page of a locale other than this system's, which would read
+    // differently in this system's code page: Russian (1251), or else Greek (1253).
+    let (locale, ansi, text) = if unsafe { GetACP() } != 1251 {
+        let privet = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}";
+        (0x0419_u32, &b"\xcf\xf0\xe8\xe2\xe5\xf2\0"[..], privet)
+    } else {
+        (0x0408, &b"\xc3\xe5\xe9\xe1\0"[..], "\u{393}\u{3b5}\u{3b9}\u{3b1}")
+    };
+    // Also from a source that cannot list its formats, which is asked for its `CF_LOCALE`.
+    let listings =
+        [Listing::Formats, Listing::Fails(E_NOTIMPL), Listing::NoEnumerator(OLE_S_USEREG)];
+    for listing in listings {
+        let mut source = TestSource::new(vec![
+            (CF_TEXT, Medium::Global(ansi.to_vec())),
+            (CF_LOCALE, Medium::Global(locale.to_le_bytes().to_vec())),
+        ]);
+        source.listing = listing;
+        let calls = Arc::clone(&source.calls);
+        let state = dragging(source);
+
+        assert_eq!(listed_ids(&state).unwrap(), [CF_TEXT, CF_LOCALE], "{listing:?}");
+        let read = state.read(DRAG, &TypeHint::Plaintext).unwrap();
+        assert_eq!(read.try_as_string().unwrap(), text, "{listing:?}");
+        // The read fetched the locale, then the text.
+        assert_eq!(*calls.get_data.lock().unwrap(), [CF_LOCALE, CF_TEXT], "{listing:?}");
+    }
+}
+
+#[test]
+fn a_clipboard_held_open_elsewhere_ends_the_search_for_a_format_to_read() {
+    let mut source = TestSource::new(vec![
+        (CF_UNICODETEXT, Medium::Global(utf16_text("unicode"))),
+        (CF_TEXT, Medium::Global(b"ansi\0".to_vec())),
+    ]);
+    source.failures = vec![(CF_UNICODETEXT, CLIPBRD_E_CANT_OPEN)];
+    let calls = Arc::clone(&source.calls);
+    let state = dragging(source);
+
+    let result = state.read(DRAG, &TypeHint::Plaintext);
+    assert!(matches!(result, Err(TransferError::Os(_))), "{result:?}");
+    // `CF_UNICODETEXT` was asked for until the attempts ran out, and `CF_TEXT` not at all.
+    assert_eq!(*calls.get_data.lock().unwrap(), [CF_UNICODETEXT; CLIPBOARD_ATTEMPTS]);
 }

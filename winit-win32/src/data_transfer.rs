@@ -33,8 +33,9 @@ use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::{
-    CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
-    OleDuplicateData, OleFlushClipboard, OleGetClipboard, OleInitialize, ReleaseStgMedium,
+    CF_HDROP, CF_LOCALE, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
+    DROPEFFECT_NONE, OleDuplicateData, OleFlushClipboard, OleGetClipboard, OleInitialize,
+    ReleaseStgMedium,
 };
 use windows_sys::Win32::System::SystemServices::{
     MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MK_XBUTTON1, MK_XBUTTON2,
@@ -187,11 +188,12 @@ fn enumerate_listings(data_object: &ComPtr<IDataObject>) -> Result<Vec<FormatLis
 }
 
 /// The formats that winit converts and that `data_object` says it can give, for a source that
-/// cannot list its formats.
+/// cannot list its formats, with its `CF_LOCALE`, which sets the code page of `CF_TEXT` and
+/// `CF_OEMTEXT`.
 fn query_known_formats(data_object: &ComPtr<IDataObject>) -> Result<Vec<AvailableFormat>, HRESULT> {
     let query_get_data = unsafe { data_object.vtbl::<IDataObjectVtbl>() }.QueryGetData;
     let mut formats = Vec::new();
-    for format in known_formats() {
+    for format in known_formats().into_iter().chain(ClipboardFormat::from_id(CF_LOCALE)) {
         let query = FORMATETC {
             cfFormat: format.id(),
             ptd: std::ptr::null_mut(),
@@ -300,12 +302,29 @@ fn get_medium(
     Ok(OwnedStgMedium(medium))
 }
 
-/// Reads one format of `data_object`, and decodes it.
+/// The locale identifier in the `CF_LOCALE` of `data_object`, whose formats are `formats`, if it
+/// offers one.
+fn read_locale(data_object: &ComPtr<IDataObject>, formats: &[AvailableFormat]) -> Option<u32> {
+    formats.iter().find(|available| available.format.id() == CF_LOCALE)?;
+    let medium = get_medium(data_object, CF_LOCALE, TYMED_HGLOBAL as u32).ok()?;
+    if medium.0.tymed != TYMED_HGLOBAL as u32 {
+        return None;
+    }
+    let locked = LockedGlobal::lock(unsafe { medium.0.u.hGlobal })?;
+    Some(u32::from_le_bytes(locked.bytes().get(..4)?.try_into().ok()?))
+}
+
+/// Reads one format of `data_object`, whose formats are `formats`, and decodes it.
 fn read_format(
     data_object: &ComPtr<IDataObject>,
     available: &AvailableFormat,
+    formats: &[AvailableFormat],
 ) -> Result<Payload, ReadError> {
     let format = &available.format;
+    let locale = match format.known() {
+        Some(KnownFormat::AnsiText | KnownFormat::OemText) => read_locale(data_object, formats),
+        _ => None,
+    };
     let mut medium = get_medium(data_object, format.id(), available.media)?;
     // A source that offers a stream may answer with an empty global memory object instead; its
     // stream is read then, if it gives one.
@@ -329,13 +348,14 @@ fn read_format(
             let hglobal = unsafe { medium.0.u.hGlobal };
             match unsafe { GlobalSize(hglobal) } {
                 // An empty global memory object has no memory to lock.
-                0 if !hglobal.is_null() => decode(format, Cow::Borrowed(&[])),
+                0 if !hglobal.is_null() => decode(format, Cow::Borrowed(&[]), locale),
                 _ => LockedGlobal::lock(hglobal)
-                    .and_then(|locked| decode(format, Cow::Borrowed(locked.bytes()))),
+                    .and_then(|locked| decode(format, Cow::Borrowed(locked.bytes()), locale)),
             }
         },
         TYMED_ISTREAM => {
-            decode(format, Cow::Owned(unsafe { read_stream(medium.0.u.pstm.cast()) }?))
+            let bytes = unsafe { read_stream(medium.0.u.pstm.cast()) }?;
+            decode(format, Cow::Owned(bytes), locale)
         },
         _ => None,
     };
@@ -1327,9 +1347,10 @@ impl DataTransferState {
         };
         let mut result = Err(ReadError::Invalid);
         for available in candidates(&formats, type_) {
-            result = read_format(&data_object, available)
+            result = read_format(&data_object, available, &formats)
                 .map(|payload| WinTypedData::new(available.format.clone(), payload));
-            if result.is_ok() {
+            // A clipboard that another application holds open cannot give another format either.
+            if matches!(result, Ok(_) | Err(ReadError::Call { hr: CLIPBRD_E_CANT_OPEN, .. })) {
                 break;
             }
         }

@@ -5,6 +5,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::{fmt, io};
 
+use windows_sys::Win32::Globalization::{
+    CP_ACP, CP_OEMCP, GetLocaleInfoW, LOCALE_IDEFAULTANSICODEPAGE, LOCALE_IDEFAULTCODEPAGE,
+    LOCALE_RETURN_NUMBER, MultiByteToWideChar,
+};
+use windows_sys::Win32::Graphics::Gdi::{BI_BITFIELDS, BI_RGB};
 use windows_sys::Win32::System::Com::{DVASPECT_CONTENT, TYMED_HGLOBAL, TYMED_ISTREAM};
 use windows_sys::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClipboardFormatW};
 use windows_sys::Win32::System::Ole::{
@@ -53,18 +58,49 @@ const STANDARD_FORMATS: &[(u16, &str)] = &[
 pub(crate) enum KnownFormat {
     /// `CF_UNICODETEXT`: UTF-16 text.
     UnicodeText,
+    /// `CF_TEXT`: text in the ANSI code page.
+    AnsiText,
+    /// `CF_OEMTEXT`: text in the OEM code page.
+    OemText,
+    /// `"HTML Format"`: the HTML Clipboard Format.
+    Html,
+    /// `"Rich Text Format"`: RTF.
+    Rtf,
     /// `CF_HDROP`: a list of files.
     FileList,
+    /// `"UniformResourceLocatorW"`: a URL, as UTF-16.
+    Url,
     /// `"PNG"`: a PNG image.
     Png,
+    /// `CF_DIBV5`: a device-independent bitmap with a `BITMAPV5HEADER`.
+    DibV5,
+    /// `CF_DIB`: a device-independent bitmap.
+    Dib,
+    /// `CF_TIFF`: a TIFF image.
+    Tiff,
+    /// `CF_WAVE`: WAVE audio.
+    Wave,
 }
 
 /// The standard formats that winit converts.
-const STANDARD_KNOWN_FORMATS: &[(u16, KnownFormat)] =
-    &[(CF_UNICODETEXT, KnownFormat::UnicodeText), (CF_HDROP, KnownFormat::FileList)];
+const STANDARD_KNOWN_FORMATS: &[(u16, KnownFormat)] = &[
+    (CF_UNICODETEXT, KnownFormat::UnicodeText),
+    (CF_TEXT, KnownFormat::AnsiText),
+    (CF_OEMTEXT, KnownFormat::OemText),
+    (CF_HDROP, KnownFormat::FileList),
+    (CF_DIBV5, KnownFormat::DibV5),
+    (CF_DIB, KnownFormat::Dib),
+    (CF_TIFF, KnownFormat::Tiff),
+    (CF_WAVE, KnownFormat::Wave),
+];
 
 /// The registered formats that winit converts, by name.
-const REGISTERED_FORMATS: &[(&str, KnownFormat)] = &[("PNG", KnownFormat::Png)];
+const REGISTERED_FORMATS: &[(&str, KnownFormat)] = &[
+    ("HTML Format", KnownFormat::Html),
+    ("Rich Text Format", KnownFormat::Rtf),
+    ("UniformResourceLocatorW", KnownFormat::Url),
+    ("PNG", KnownFormat::Png),
+];
 
 impl KnownFormat {
     fn identify(id: u16, name: &str) -> Option<Self> {
@@ -84,9 +120,36 @@ impl KnownFormat {
 
     fn hint(self) -> TypeHint {
         match self {
-            Self::UnicodeText => TypeHint::Plaintext,
-            Self::FileList => TypeHint::UriList,
+            Self::UnicodeText | Self::AnsiText | Self::OemText => TypeHint::Plaintext,
+            Self::Html => TypeHint::Html,
+            Self::Rtf => TypeHint::Rtf,
+            Self::FileList | Self::Url => TypeHint::UriList,
             Self::Png => TypeHint::Image { extension_hint: Some("png") },
+            Self::DibV5 | Self::Dib => TypeHint::Image { extension_hint: Some("bmp") },
+            Self::Tiff => TypeHint::Image { extension_hint: Some("tiff") },
+            Self::Wave => TypeHint::Audio { extension_hint: Some("wav") },
+        }
+    }
+
+    /// The preference for this format among the formats that match the same hint: the lowest
+    /// rank is read first.
+    fn rank(self) -> u8 {
+        match self {
+            Self::UnicodeText
+            | Self::Html
+            | Self::Rtf
+            | Self::FileList
+            | Self::Png
+            | Self::Wave => 0,
+            // Lossy: they cannot hold every character.
+            Self::AnsiText => 1,
+            Self::OemText => 2,
+            // A link, where a file list names files.
+            Self::Url => 1,
+            // Losslessly converted, but larger than PNG; a V5 header can describe alpha.
+            Self::DibV5 => 1,
+            Self::Dib => 2,
+            Self::Tiff => 3,
         }
     }
 }
@@ -254,7 +317,7 @@ pub(crate) struct AvailableFormat {
 /// The formats of `available` to read for `requested`, in the order to try them.
 ///
 /// A [`ClipboardFormat`] is read as itself. Any other type is read from the formats whose hint
-/// matches its hint.
+/// matches its hint, the most faithful first.
 pub(crate) fn candidates<'a>(
     available: &'a [AvailableFormat],
     requested: &dyn TransferType,
@@ -265,10 +328,13 @@ pub(crate) fn candidates<'a>(
     let Some(hint) = requested.hint() else {
         return Vec::new();
     };
-    available
+    let mut candidates: Vec<_> = available
         .iter()
         .filter(|available| available.format.hint().is_some_and(|other| other.matches(&hint)))
-        .collect()
+        .collect();
+    // Only known formats have hints. The sort is stable: the source's order breaks ties.
+    candidates.sort_by_key(|available| available.format.known.map(KnownFormat::rank));
+    candidates
 }
 
 /// Data read from a format.
@@ -281,13 +347,206 @@ pub(crate) enum Payload {
 
 /// Decodes the bytes of a format, or returns `None` when they are not valid data of the format.
 ///
-/// A file list is read through its `HGLOBAL` instead, with `DragQueryFileW`.
-pub(crate) fn decode(format: &ClipboardFormat, bytes: Cow<'_, [u8]>) -> Option<Payload> {
-    match format.known {
-        Some(KnownFormat::UnicodeText) => Some(Payload::Text(utf16_until_nul(&bytes))),
-        Some(KnownFormat::FileList) => None,
-        Some(KnownFormat::Png) | None => Some(Payload::Bytes(bytes.into_owned())),
+/// `locale` is the locale identifier in the `CF_LOCALE` of the source, if it offers one; it sets
+/// the code page of `CF_TEXT` and `CF_OEMTEXT`. A file list is read through its `HGLOBAL`
+/// instead, with `DragQueryFileW`. A format that is not decoded is returned as its bytes; the
+/// bytes of a global memory object may end with padding, as `GlobalSize` may exceed the size it
+/// was allocated with.
+pub(crate) fn decode(
+    format: &ClipboardFormat,
+    bytes: Cow<'_, [u8]>,
+    locale: Option<u32>,
+) -> Option<Payload> {
+    let payload = match format.known {
+        Some(KnownFormat::UnicodeText) => Payload::Text(utf16_until_nul(&bytes)),
+        Some(known @ (KnownFormat::AnsiText | KnownFormat::OemText)) => {
+            Payload::Text(code_page_text(until_nul(&bytes), text_code_page(known, locale))?)
+        },
+        Some(KnownFormat::Html) => {
+            Payload::Text(String::from_utf8_lossy(html_clipboard_document(&bytes)?).into_owned())
+        },
+        // RTF is 7-bit text, but may be written in the ANSI code page.
+        Some(KnownFormat::Rtf) => Payload::Text(match std::str::from_utf8(until_nul(&bytes)) {
+            Ok(rtf) => rtf.to_owned(),
+            Err(_) => code_page_text(until_nul(&bytes), CP_ACP)?,
+        }),
+        Some(KnownFormat::FileList) => return None,
+        Some(KnownFormat::Url) => {
+            let url = utf16_until_nul(&bytes);
+            let url = url.trim();
+            if url.is_empty() {
+                return None;
+            }
+            Payload::Uris(vec![url.to_owned()])
+        },
+        Some(KnownFormat::DibV5 | KnownFormat::Dib) => Payload::Bytes(dib_to_bmp(&bytes)?),
+        Some(KnownFormat::Png | KnownFormat::Tiff | KnownFormat::Wave) | None => {
+            Payload::Bytes(bytes.into_owned())
+        },
+    };
+    Some(payload)
+}
+
+/// The code page of the text of `format`, `CF_TEXT` or `CF_OEMTEXT`, which Microsoft ties to the
+/// `CF_LOCALE` of its source: the ANSI or OEM code page of the locale `locale`, or of this system
+/// when the source gives no locale or the locale has no such code page.
+pub(crate) fn text_code_page(format: KnownFormat, locale: Option<u32>) -> u32 {
+    let (info, system) = match format {
+        KnownFormat::OemText => (LOCALE_IDEFAULTCODEPAGE, CP_OEMCP),
+        _ => (LOCALE_IDEFAULTANSICODEPAGE, CP_ACP),
+    };
+    let mut number = [0u16; 2];
+    locale
+        .filter(|&lcid| {
+            let len = unsafe {
+                GetLocaleInfoW(lcid, info | LOCALE_RETURN_NUMBER, number.as_mut_ptr(), 2)
+            };
+            len == 2
+        })
+        .map(|_| u32::from(number[0]) | (u32::from(number[1]) << 16))
+        // A locale without an ANSI or OEM code page gives `CP_ACP` or `CP_OEMCP`.
+        .filter(|&code_page| code_page != CP_ACP && code_page != CP_OEMCP)
+        .unwrap_or(system)
+}
+
+/// The bytes before the first NUL.
+pub(crate) fn until_nul(bytes: &[u8]) -> &[u8] {
+    bytes.iter().position(|&byte| byte == 0).map_or(bytes, |nul| &bytes[..nul])
+}
+
+/// Decodes text in the code page `code_page` with `MultiByteToWideChar`, or returns `None` if
+/// the conversion fails.
+pub(crate) fn code_page_text(bytes: &[u8], code_page: u32) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
     }
+    let len = i32::try_from(bytes.len()).ok()?;
+    let wide_len =
+        unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    let mut wide = vec![0; usize::try_from(wide_len).ok().filter(|&len| len > 0)?];
+    let written = unsafe {
+        MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), wide_len)
+    };
+    let written = usize::try_from(written).ok().filter(|&len| len > 0)?;
+    Some(String::from_utf16_lossy(&wide[..written.min(wide.len())]))
+}
+
+/// The HTML of the [HTML Clipboard Format]: its context, `StartHTML..EndHTML`, which Microsoft
+/// documents as a complete HTML document, or its fragment, `StartFragment..EndFragment`, when it
+/// has no valid context. Returns `None` when it has neither.
+///
+/// The offsets are read from the description at the start of the data, a field's first
+/// occurrence counting. An offset past the end of the data is taken as the end, and the HTML ends
+/// at a NUL.
+///
+/// [HTML Clipboard Format]: https://learn.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format
+pub(crate) fn html_clipboard_document(bytes: &[u8]) -> Option<&[u8]> {
+    const FIELDS: [&[u8]; 4] = [b"StartHTML", b"EndHTML", b"StartFragment", b"EndFragment"];
+
+    let mut offsets: [Option<Option<i64>>; 4] = [None; 4];
+    // The description is a list of `name:value` lines.
+    for line in bytes.split(|&byte| byte == b'\r' || byte == b'\n').filter(|line| !line.is_empty())
+    {
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            break;
+        };
+        let (name, value) = (&line[..colon], &line[colon + 1..]);
+        if name.is_empty() || !name.iter().all(u8::is_ascii_alphanumeric) {
+            break;
+        }
+        if let Some(field) = FIELDS.iter().position(|field| *field == name) {
+            offsets[field].get_or_insert_with(|| {
+                std::str::from_utf8(value).ok().and_then(|value| value.trim().parse().ok())
+            });
+        }
+    }
+
+    let region = |start: Option<Option<i64>>, end: Option<Option<i64>>| {
+        let start = usize::try_from(start.flatten()?).ok()?;
+        let end = usize::try_from(end.flatten()?).ok()?.min(bytes.len());
+        let html = until_nul(bytes.get(start..end)?);
+        (!html.is_empty()).then_some(html)
+    };
+    region(offsets[0], offsets[1]).or_else(|| region(offsets[2], offsets[3]))
+}
+
+/// The compression of a bitmap whose pixels are uncompressed, with four color masks.
+const BI_ALPHABITFIELDS: u32 = 6;
+
+/// Converts a packed device-independent bitmap, as `CF_DIB` and `CF_DIBV5` hold it, to a BMP
+/// file, or returns `None` when it is not a valid bitmap.
+///
+/// A BMP file is the bitmap after a `BITMAPFILEHEADER`, whose `bfOffBits` is the offset of the
+/// pixels: they follow the header, the color masks of a `BITMAPINFOHEADER` with `BI_BITFIELDS`
+/// (three) or `BI_ALPHABITFIELDS` (four) compression, as the later headers contain their masks,
+/// and the color table. The bitmap must hold all its pixels: rows of its width padded to four
+/// bytes, as many as its height, which is negative for a top-down bitmap, or the size it gives
+/// for compressed pixels.
+pub(crate) fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
+    const FILE_HEADER_LEN: usize = 14;
+    const INFO_HEADER_LEN: usize = 40;
+
+    let u16_at = |at: usize| Some(u16::from_le_bytes(dib.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?));
+    let i32_at = |at: usize| Some(i32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?));
+
+    let header_len = usize::try_from(u32_at(0)?).ok()?;
+    // A `BITMAPCOREHEADER` has a color table of `RGBTRIPLE`s, the later headers of `RGBQUAD`s.
+    let (width, height, planes, bit_count, compression, image_size, colors_used, color_len) =
+        match header_len {
+            12 => {
+                let (width, height) = (i64::from(u16_at(4)?), i64::from(u16_at(6)?));
+                (width, height, u16_at(8)?, u16_at(10)?, BI_RGB, 0, 0, 3)
+            },
+            40 | 52 | 56 | 108 | 124 => {
+                let (width, height) = (i64::from(i32_at(4)?), i64::from(i32_at(8)?));
+                (width, height, u16_at(12)?, u16_at(14)?, u32_at(16)?, u32_at(20)?, u32_at(32)?, 4)
+            },
+            _ => return None,
+        };
+    if planes != 1 || width <= 0 || height == 0 {
+        return None;
+    }
+    // A bitmap of no more than 8 bits per pixel has a color table of all its colors unless it
+    // gives how many it uses; a JPEG or PNG one, of 0 bits per pixel, has none.
+    let colors = match (colors_used, bit_count) {
+        (0, 1..=8) => 1 << bit_count,
+        (colors, _) => usize::try_from(colors).ok()?,
+    };
+    let masks = match (header_len, compression) {
+        (INFO_HEADER_LEN, BI_BITFIELDS) => 3,
+        (INFO_HEADER_LEN, BI_ALPHABITFIELDS) => 4,
+        _ => 0,
+    };
+    let pixels_at =
+        header_len.checked_add(masks * 4)?.checked_add(colors.checked_mul(color_len)?)?;
+    let pixels_len = match compression {
+        BI_RGB | BI_BITFIELDS | BI_ALPHABITFIELDS => {
+            if !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
+                return None;
+            }
+            let row_bits = u64::try_from(width).ok()?.checked_mul(bit_count.into())?;
+            let stride = row_bits.checked_add(31)? / 32 * 4;
+            stride.checked_mul(height.unsigned_abs())?
+        },
+        // Compressed pixels have the size the header gives.
+        _ if image_size > 0 => u64::from(image_size),
+        _ => return None,
+    };
+    let pixels_end = u64::try_from(pixels_at).ok()?.checked_add(pixels_len)?;
+    if pixels_end > u64::try_from(dib.len()).ok()? {
+        return None;
+    }
+
+    let file_len = u32::try_from(FILE_HEADER_LEN + dib.len()).ok()?;
+    let pixels_at = u32::try_from(FILE_HEADER_LEN + pixels_at).ok()?;
+    let mut bmp = Vec::with_capacity(FILE_HEADER_LEN + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_len.to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&pixels_at.to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Some(bmp)
 }
 
 /// Decodes UTF-16 text that ends at its first NUL, or at the end of `bytes`. An odd last byte is
