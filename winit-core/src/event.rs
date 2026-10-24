@@ -159,7 +159,9 @@ pub enum WindowEvent {
         value: Arc<dyn TypedData>,
     },
 
-    /// A drag operation started with `start_drag` has been dropped.
+    /// A drag operation started with `start_drag` has been dropped, and the drop target has
+    /// accepted the drop. A drop the target refuses is reported as
+    /// [`OutgoingDragCanceled`](Self::OutgoingDragCanceled) instead.
     OutgoingDragDropped {
         /// The ID returned from `start_drag`
         id: DataTransferId,

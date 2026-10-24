@@ -676,30 +676,24 @@ impl DataSourceHandler for WinitState {
     }
 
     fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
-        let Some(current_drag) = self.data_transfer_state.send_drag() else {
+        // The drop is not complete yet: the target can still refuse it, and the compositor then
+        // cancels the source. The drag ends at `dnd_finished` or at `cancelled`.
+    }
+
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        let Some(current_drag) =
+            self.data_transfer_state.send_drag.take_if(|drag| drag.data_source.inner() == source)
+        else {
             return;
         };
 
-        let window_id = current_drag.window_id;
-        let id = current_drag.data_transfer_id;
-        let selected_action = current_drag.selected_action;
-
         self.events_sink.push_window_event(
             WindowEvent::OutgoingDragDropped {
-                id,
-                action: dnd_action_wl_to_winit(selected_action),
+                id: current_drag.data_transfer_id,
+                action: dnd_action_wl_to_winit(current_drag.selected_action),
             },
-            window_id,
+            current_drag.window_id,
         );
-    }
-
-    fn dnd_finished(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wayland_client::protocol::wl_data_source::WlDataSource,
-    ) {
-        self.data_transfer_state.clear_send_drag();
     }
 
     fn action(
@@ -1111,20 +1105,10 @@ impl DataTransferState {
         }
     }
 
-    fn send_drag(&self) -> Option<&DragSource> {
-        self.send_drag.as_ref()
-    }
-
     fn set_target_drag_action(&mut self, action: WlDndAction) {
         if let Some(source) = &mut self.send_drag {
             source.selected_action = action;
         }
-    }
-
-    /// Returns `true` if a drag operation was in progress, `false` if no drag operation was in
-    /// progress.
-    fn clear_send_drag(&mut self) -> bool {
-        self.send_drag.take().is_some()
     }
 }
 
