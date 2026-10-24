@@ -299,7 +299,8 @@ impl EventLoop {
                 NotSupportedError::new("the X11 backend requires the XFixes extension")
             })?;
 
-        let data_transfer_state = DataTransferState::new(Arc::clone(&xconn)).into();
+        let data_transfer_state =
+            DataTransferState::new(Arc::clone(&xconn)).map_err(|err| os_error!(err))?.into();
         // Check for XInput2 support.
         xconn
             .xcb_connection()
@@ -758,21 +759,15 @@ impl ActiveEventLoop {
         self.exit.get()
     }
 
-    /// We must choose a window to get the clipboard from or attach it to. Currently choose the
-    /// focused window (TODO: better strategy?).
-    pub(crate) fn clipboard_window(&self) -> Option<xproto::Window> {
-        self.windows
-            .borrow()
+    /// The window to deliver a clipboard fetch to: the clipboard is not tied to a window, so its
+    /// data goes to the focused window, or to any window if none has the focus.
+    pub(crate) fn focused_or_any_window(&self) -> Option<WindowId> {
+        let windows = self.windows.borrow();
+        windows
             .iter()
             .find(|(_, window)| window.upgrade().is_some_and(|window| window.has_focus()))
-            .map(|(id, _)| id.into_raw() as _)
-            .or_else(|| {
-                self.windows
-                    .borrow()
-                    .iter()
-                    .find(|(_, window)| window.upgrade().is_some())
-                    .map(|(id, _)| id.into_raw() as _)
-            })
+            .or_else(|| windows.iter().find(|(_, window)| window.upgrade().is_some()))
+            .map(|(id, _)| *id)
     }
 
     fn read_clipboard(
@@ -794,11 +789,8 @@ impl ActiveEventLoop {
         clipboard: ClipboardSelectionType,
         send_data: Box<dyn DataTransferSend>,
     ) -> Result<(), TransferError> {
-        let Some(xwindow) = self.clipboard_window() else {
-            return Err(os_error!("no active window").into());
-        };
         let mut data_transfer = self.data_transfer_state.borrow_mut();
-        data_transfer.set_clipboard(xwindow, send_data, clipboard);
+        data_transfer.set_clipboard(send_data, clipboard);
 
         Ok(())
     }
@@ -901,10 +893,10 @@ impl RootActiveEventLoop for ActiveEventLoop {
         }
 
         if let Some(clipboard) = data_transfer.resolve_clipboard_type(id) {
-            let Some(clip_win) = self.clipboard_window() else {
+            let Some(window) = self.focused_or_any_window() else {
                 return Err(TransferError::Failed);
             };
-            data_transfer.fetch_clipboard_data_transfer(clipboard, type_, clip_win)
+            data_transfer.fetch_clipboard_data_transfer(clipboard, type_, window)
         } else {
             Err(TransferError::UnknownTransfer(id))
         }

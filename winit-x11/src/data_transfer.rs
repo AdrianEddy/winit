@@ -16,7 +16,7 @@ use winit_core::event_loop::AsyncRequestSerial;
 use winit_core::window::WindowId;
 use x11_dl::xlib::{XPropertyEvent, XSelectionEvent, XSelectionRequestEvent};
 use x11rb::CURRENT_TIME;
-use x11rb::connection::RequestConnection as _;
+use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::errors::ReplyError;
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt};
@@ -256,7 +256,17 @@ pub struct ClipboardState {
     /// Cached types available for pasting
     types: Arc<[SelectionType]>,
     /// A list of the fetch requests with the first one being in progress
-    pending_fetch_types: VecDeque<(AsyncRequestSerial, SelectionType)>,
+    pending_fetch_types: VecDeque<PendingFetch>,
+}
+
+/// A fetch of the clipboard requested with `fetch_data_transfer`.
+#[derive(Debug)]
+pub(crate) struct PendingFetch {
+    serial: AsyncRequestSerial,
+    ty: SelectionType,
+    /// The window to deliver the data to: the clipboard is not tied to a window, so it is chosen
+    /// when the fetch is requested.
+    window: WindowId,
 }
 
 impl Default for ClipboardState {
@@ -286,9 +296,17 @@ impl ClipboardState {
         Selection::new(Arc::clone(&self.types))
     }
     /// Adds a request to the fetch, returning true if the fetch should start immediately
-    pub fn add_to_fetch(&mut self, serial: AsyncRequestSerial, ty: SelectionType) -> bool {
-        self.pending_fetch_types.push_back((serial, ty));
+    pub(crate) fn add_to_fetch(&mut self, fetch: PendingFetch) -> bool {
+        self.pending_fetch_types.push_back(fetch);
         self.pending_fetch_types.len() == 1
+    }
+
+    /// Complete the fetch in progress with its data, delivered to the window chosen when it was
+    /// requested.
+    pub(crate) fn finish_fetch(&mut self, data: Vec<u8>) -> Option<FinishedDataTransfer> {
+        let PendingFetch { serial, ty, window } = self.pending_fetch_types.pop_front()?;
+        let value = Arc::new(SelectionReader { type_: ty, data });
+        Some(FinishedDataTransfer { id: self.transfer_serial, serial, value, window })
     }
 
     /// From the list of types available on the clipboard, find the first available type that
@@ -436,6 +454,9 @@ pub(crate) fn selection_notify_reply(
 #[derive(Debug)]
 pub struct DataTransferState {
     xconn: Arc<XConnection>,
+    /// The window that owns this application's selections and receives the conversions it
+    /// requests. See [`DataTransferState::new`].
+    selection_window: xproto::Window,
     // If `None`, no drag operation is in progress.
     state: Option<DragState>,
 
@@ -578,14 +599,36 @@ impl DataTransfer for Selection {
 }
 
 impl DataTransferState {
-    pub fn new(xconn: Arc<XConnection>) -> Self {
+    pub fn new(xconn: Arc<XConnection>) -> Result<Self, X11Error> {
         let conn = xconn.xcb_connection();
+        let root = xconn.default_root().root;
+
+        // Selections are owned, and the conversions this application requests are received,
+        // through a window of its own that lives as long as the event loop. Neither may depend
+        // on a window of the application: when the owner's window is destroyed, the selection
+        // reverts to no owner without a `SelectionClear`, and a conversion whose requestor
+        // window is gone is never answered. The window is never mapped; it selects property
+        // changes to receive incremental (INCR) transfers.
+        let selection_window = conn.generate_id()?;
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            selection_window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            xproto::WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new().event_mask(xproto::EventMask::PROPERTY_CHANGE),
+        )?
+        .check()?;
 
         // Listen for all selection owner changes for the clipboard. This is a bit hacky but we must
         // know all of the types when the user wants to paste.
         match conn.xfixes_query_version(5, 0).map_err(ReplyError::from).and_then(|c| c.reply()) {
             Ok(_) => {
-                let root = xconn.default_root().root;
                 for item in ClipboardSelectionType::iter() {
                     conn.xfixes_select_selection_input(
                         root,
@@ -600,14 +643,29 @@ impl DataTransferState {
 
         let incr_threshold = incr_threshold(conn.maximum_request_bytes());
 
-        DataTransferState {
+        let data_transfer = DataTransferState {
             xconn,
+            selection_window,
             state: Default::default(),
             clipboards: Default::default(),
             clip_incr_send: Default::default(),
             clip_incr_receive: Default::default(),
             incr_threshold,
+        };
+
+        // Request the types on offer in the selections that already have an owner.
+        for clipboard in ClipboardSelectionType::iter() {
+            if let Err(err) = data_transfer.request_targets(clipboard) {
+                debug!("Not requesting the initial TARGETS of {clipboard:?}: {err}");
+            }
         }
+
+        Ok(data_transfer)
+    }
+
+    /// The window that owns this application's selections and receives its conversions.
+    pub fn selection_window(&self) -> xproto::Window {
+        self.selection_window
     }
 
     pub fn state(&self) -> Option<&DragState> {
@@ -949,8 +1007,10 @@ impl DataTransferState {
         let atom = xev.atom as xproto::Atom;
         let xwindow = xev.window as xproto::Window;
 
-        // We only care about new values
-        if xev.state as u32 != xproto::Property::NEW_VALUE.into() {
+        // We only care about new values, of the properties our conversions are received in
+        if xev.state as u32 != xproto::Property::NEW_VALUE.into()
+            || xwindow != self.selection_window
+        {
             return None;
         }
 
@@ -979,18 +1039,21 @@ impl DataTransferState {
             self.xconn.atom_str(ty.atom())
         );
 
-        self.send_clipboard_data(xwindow, clipboard, data)
+        self.send_clipboard_data(clipboard, data)
     }
 
     /// Start the next clipboard fetch from the queue.
-    pub fn do_next_clipboard_fetch(
-        &mut self,
-        clipboard: ClipboardSelectionType,
-        xwindow: xproto::Window,
-    ) {
+    pub fn do_next_clipboard_fetch(&mut self, clipboard: ClipboardSelectionType) {
         let selection = clipboard.selection_atom(self.xconn.atoms());
-        while let Some((_, ty)) = self.get_clipboard(clipboard).pending_fetch_types.front() {
-            match self.xconn.convert_selection(xwindow, selection, ty.atom(), selection) {
+        while let Some(PendingFetch { ty, .. }) =
+            self.get_clipboard(clipboard).pending_fetch_types.front()
+        {
+            match self.xconn.convert_selection(
+                self.selection_window,
+                selection,
+                ty.atom(),
+                selection,
+            ) {
                 Ok(()) => {
                     trace!("Converting next selection {}", self.xconn.atom_str(ty.atom()));
                     return;
@@ -1009,23 +1072,17 @@ impl DataTransferState {
     #[must_use]
     pub fn send_clipboard_data(
         &mut self,
-        xwindow: xproto::Window,
         clipboard: ClipboardSelectionType,
         data: Vec<u8>,
     ) -> Option<FinishedDataTransfer> {
-        let Some((serial, type_)) =
-            self.get_clipboard_mut(clipboard).pending_fetch_types.pop_front()
-        else {
+        let Some(finished) = self.get_clipboard_mut(clipboard).finish_fetch(data) else {
             warn!("Got finished fetch but no fetches were pending");
             return None;
         };
-        let value = Arc::new(SelectionReader { type_, data });
-        let id = self.get_clipboard(clipboard).transfer_serial;
 
-        self.do_next_clipboard_fetch(clipboard, xwindow);
+        self.do_next_clipboard_fetch(clipboard);
 
-        let window = crate::event_loop::mkwid(xwindow);
-        Some(FinishedDataTransfer { id, serial, value, window })
+        Some(finished)
     }
 
     /// Check if we are the ones sending and the receiver deleted their property for the clipboard
@@ -1097,12 +1154,7 @@ impl DataTransferState {
         self.get_clipboard_mut(clipboard).types = targets.into();
     }
 
-    pub fn request_updated_targets(
-        &mut self,
-        clipboard: ClipboardSelectionType,
-        xwindow: xproto::Window,
-        serial: u64,
-    ) {
+    pub fn request_updated_targets(&mut self, clipboard: ClipboardSelectionType, serial: u64) {
         let clipboard_state = self.get_clipboard_mut(clipboard);
 
         // Sometimes you get duplicate update events. Skip these.
@@ -1120,14 +1172,17 @@ impl DataTransferState {
 
         self.clear_clipboard(clipboard);
 
+        if let Err(e) = self.request_targets(clipboard) {
+            error!("Unable to request TARGETS for {clipboard:?}: {e}")
+        }
+    }
+
+    /// Request the list of types on offer in a selection.
+    fn request_targets(&self, clipboard: ClipboardSelectionType) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
         let selection = clipboard.selection_atom(atoms);
         let property = clipboard.property_atom(atoms);
-        if let Err(e) = self.xconn.convert_selection(xwindow, selection, atoms[TARGETS], property) {
-            let selection = self.xconn.atom_str(selection);
-            let property = self.xconn.atom_str(property);
-            error!("Unable to request TARGETS for {selection} into {property}: {e}")
-        }
+        self.xconn.convert_selection(self.selection_window, selection, atoms[TARGETS], property)
     }
 
     pub fn request_clipboard_read(&mut self, clipboard: ClipboardSelectionType) -> DataTransferId {
@@ -1143,12 +1198,14 @@ impl DataTransferState {
     /// Update the internal cache of the clipboard contents
     pub fn set_clipboard(
         &mut self,
-        xwindow: xproto::Window,
         send_data: Box<dyn DataTransferSend>,
         clipboard: ClipboardSelectionType,
     ) {
         self.get_clipboard_mut(clipboard).owned_data = Some(send_data);
-        self.xconn.set_selection_owner(xwindow, clipboard.selection_atom(self.xconn.atoms()));
+        self.xconn.set_selection_owner(
+            self.selection_window,
+            clipboard.selection_atom(self.xconn.atoms()),
+        );
     }
 
     pub(crate) fn fetch_dnd_data_transfer(
@@ -1191,11 +1248,12 @@ impl DataTransferState {
         Ok(serial)
     }
 
+    /// Fetch the clipboard's data of type `type_`, delivering it to `window`.
     pub(crate) fn fetch_clipboard_data_transfer(
         &mut self,
         clipboard: ClipboardSelectionType,
         type_: &dyn TransferType,
-        xwindow: xproto::Window,
+        window: WindowId,
     ) -> Result<AsyncRequestSerial, TransferError> {
         let ty = type_
             .cast_ref::<SelectionType>()
@@ -1207,10 +1265,10 @@ impl DataTransferState {
 
         let serial = AsyncRequestSerial::get();
         let should_emit_convert_selection =
-            self.get_clipboard_mut(clipboard).add_to_fetch(serial, ty);
+            self.get_clipboard_mut(clipboard).add_to_fetch(PendingFetch { serial, ty, window });
 
         if should_emit_convert_selection {
-            self.do_next_clipboard_fetch(clipboard, xwindow);
+            self.do_next_clipboard_fetch(clipboard);
         }
 
         Ok(serial)
@@ -1230,6 +1288,14 @@ impl DataTransferState {
         }
         self.clip_incr_receive.retain(|receive| receive.clipboard != clipboard);
         self.clip_incr_send.retain(|receive| receive.clipboard != clipboard);
+    }
+}
+
+impl Drop for DataTransferState {
+    fn drop(&mut self) {
+        if let Ok(cookie) = self.xconn.xcb_connection().destroy_window(self.selection_window) {
+            cookie.ignore_error();
+        }
     }
 }
 

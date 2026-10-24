@@ -206,3 +206,20 @@ fn incremental_transfers_start_at_the_maximum_request_size() {
     // A server with BIG-REQUESTS: one request still stores at most 256 KiB.
     assert_eq!(incr_threshold(16 * 1024 * 1024), 256 * 1024);
 }
+
+#[test]
+fn a_clipboard_fetch_is_delivered_to_the_window_it_was_requested_for() {
+    let mut state = ClipboardState::default();
+    let utf8 = SelectionType { hint: Some(TypeHint::Plaintext), atom: UTF8_STRING_ATOM };
+    let (first, second) = (AsyncRequestSerial::get(), AsyncRequestSerial::get());
+    let (window_a, window_b) = (WindowId::from_raw(1), WindowId::from_raw(2));
+
+    assert!(state.add_to_fetch(PendingFetch { serial: first, ty: utf8.clone(), window: window_a }));
+    assert!(!state.add_to_fetch(PendingFetch { serial: second, ty: utf8, window: window_b }));
+
+    let finished = state.finish_fetch(b"a".to_vec()).expect("the first fetch is pending");
+    assert_eq!((finished.serial, finished.window()), (first, window_a));
+    let finished = state.finish_fetch(b"b".to_vec()).expect("the second fetch is pending");
+    assert_eq!((finished.serial, finished.window()), (second, window_b));
+    assert!(state.finish_fetch(Vec::new()).is_none());
+}
