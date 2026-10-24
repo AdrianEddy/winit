@@ -137,56 +137,8 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                     }
                 };
 
-                // The events are sent to the user separately, so
-                // CAUTION: events must always arrive in the order compatible with the application
-                // order specified by the text-input-v3 protocol:
-                //
-                // As of version 1:
-                // 1. Replace existing preedit string with the cursor.
-                // 2. Delete requested surrounding text.
-                // 3. Insert commit string with the cursor at its end.
-                // 4. Calculate surrounding text to send.
-                // 5. Insert new preedit text in cursor position.
-                // 6. Place cursor inside preedit text.
-
-                if let Some(DeleteSurroundingText { before, after }) =
-                    text_input_data.pending_delete.take()
-                {
-                    state.events_sink.push_window_event(
-                        WindowEvent::Ime(Ime::DeleteSurrounding {
-                            before_bytes: before,
-                            after_bytes: after,
-                        }),
-                        window_id,
-                    );
-                }
-
-                // Send `Commit`.
-                if let Some(text) = text_input_data.pending_commit.take() {
-                    text_input_data.last_preedit_empty = true;
-                    state
-                        .events_sink
-                        .push_window_event(WindowEvent::Ime(Ime::Commit(text)), window_id);
-                } else if text_input_data.pending_preedit.is_none()
-                    && !text_input_data.last_preedit_empty
-                {
-                    text_input_data.last_preedit_empty = true;
-                    state.events_sink.push_window_event(
-                        WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                        window_id,
-                    );
-                }
-
-                // Send preedit.
-                if let Some(preedit) = text_input_data.pending_preedit.take() {
-                    let cursor_range =
-                        preedit.cursor_begin.map(|b| (b, preedit.cursor_end.unwrap_or(b)));
-
-                    text_input_data.last_preedit_empty = false;
-                    state.events_sink.push_window_event(
-                        WindowEvent::Ime(Ime::Preedit(preedit.text, cursor_range)),
-                        window_id,
-                    );
+                for event in text_input_data.take_done_events() {
+                    state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
                 }
             },
             _ => {},
@@ -272,6 +224,48 @@ impl Default for TextInputDataInner {
             pending_delete: None,
             last_preedit_empty: true,
         }
+    }
+}
+
+impl TextInputDataInner {
+    /// The `Ime` events a `done` delivers, taking the pending state they apply.
+    fn take_done_events(&mut self) -> impl Iterator<Item = Ime> + use<> {
+        // The events are sent to the user separately, so
+        // CAUTION: events must always arrive in the order compatible with the application
+        // order specified by the text-input-v3 protocol:
+        //
+        // As of version 1:
+        // 1. Replace existing preedit string with the cursor.
+        // 2. Delete requested surrounding text.
+        // 3. Insert commit string with the cursor at its end.
+        // 4. Calculate surrounding text to send.
+        // 5. Insert new preedit text in cursor position.
+        // 6. Place cursor inside preedit text.
+
+        let delete = self.pending_delete.take().map(|DeleteSurroundingText { before, after }| {
+            Ime::DeleteSurrounding { before_bytes: before, after_bytes: after }
+        });
+
+        // Send `Commit`.
+        let commit_or_clear = if let Some(text) = self.pending_commit.take() {
+            self.last_preedit_empty = true;
+            Some(Ime::Commit(text))
+        } else if self.pending_preedit.is_none() && !self.last_preedit_empty {
+            self.last_preedit_empty = true;
+            Some(Ime::Preedit(String::new(), None))
+        } else {
+            None
+        };
+
+        // Send preedit.
+        let preedit = self.pending_preedit.take().map(|preedit| {
+            let cursor_range = preedit.cursor_begin.map(|b| (b, preedit.cursor_end.unwrap_or(b)));
+
+            self.last_preedit_empty = false;
+            Ime::Preedit(preedit.text, cursor_range)
+        });
+
+        [delete, commit_or_clear, preedit].into_iter().flatten()
     }
 }
 
@@ -461,3 +455,6 @@ impl Default for ContentType {
 
 delegate_dispatch!(WinitState: [ZwpTextInputManagerV3: GlobalData] => TextInputState);
 delegate_dispatch!(WinitState: [ZwpTextInputV3: TextInputData] => TextInputState);
+
+#[cfg(test)]
+mod tests;
