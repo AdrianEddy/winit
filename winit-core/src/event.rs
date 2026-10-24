@@ -160,6 +160,11 @@ pub enum WindowEvent {
     },
 
     /// A drag operation started with `start_drag` has been dropped.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **Wayland:** Sent once the drop target has finished the drop. A drop the target refuses is
+    ///   reported as [`OutgoingDragCanceled`](Self::OutgoingDragCanceled) instead.
     OutgoingDragDropped {
         /// The ID returned from `start_drag`
         id: DataTransferId,

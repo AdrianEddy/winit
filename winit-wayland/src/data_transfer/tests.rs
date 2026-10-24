@@ -24,3 +24,43 @@ fn a_custom_mime_type_is_advertised_as_itself() {
     let advertised: Vec<MimeType> = MimeType::from_dyn(&custom).collect();
     assert_eq!(advertised, [MimeType::new("application/x-example")]);
 }
+
+#[derive(Debug, PartialEq)]
+struct TestDrag {
+    id: u32,
+    dropped: bool,
+}
+
+fn test_drag(id: u32, dropped: bool) -> TestDrag {
+    TestDrag { id, dropped }
+}
+
+/// A drag started while an earlier one is still finishing (dropped, waiting for the target) leaves
+/// the earlier one in place; each ends on its own, found by identity.
+#[test]
+fn a_drag_finishing_its_drop_outlives_a_newer_drag() {
+    let mut drags = SendDrags::default();
+    assert!(drags.start(test_drag(1, true), |drag| drag.dropped).is_empty());
+    assert!(drags.start(test_drag(2, false), |drag| drag.dropped).is_empty());
+
+    drags.find_mut(|drag| drag.id == 2).unwrap().dropped = true;
+    assert_eq!(drags.take(|drag| drag.id == 1), Some(test_drag(1, true)));
+    assert_eq!(drags.take(|drag| drag.id == 2), Some(test_drag(2, true)));
+    assert_eq!(drags.take(|drag| drag.id == 1), None, "a drag ends once");
+}
+
+/// An earlier drag that was never dropped gets no further events once a newer one starts, so the
+/// newer start returns it to be ended; a dropped one keeps waiting for its target.
+#[test]
+fn a_new_drag_ends_an_earlier_drag_that_was_never_dropped() {
+    let mut drags = SendDrags::default();
+    drags.start(test_drag(1, false), |drag| drag.dropped);
+    drags.find_mut(|drag| drag.id == 1).unwrap().dropped = true;
+    assert!(drags.start(test_drag(2, false), |drag| drag.dropped).is_empty());
+
+    let abandoned = drags.start(test_drag(3, false), |drag| drag.dropped);
+    assert_eq!(abandoned, [test_drag(2, false)]);
+    assert_eq!(drags.take(|drag| drag.id == 1), Some(test_drag(1, true)));
+    assert_eq!(drags.take(|drag| drag.id == 3), Some(test_drag(3, false)));
+    assert_eq!(drags.take(|drag| drag.id == 2), None);
+}

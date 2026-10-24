@@ -447,10 +447,47 @@ pub struct DataTransferState {
     drags: HashMap<ObjectId, DragSession>,
     clipboards: HashMap<ObjectId, ClipboardSession>,
     primary_selections: HashMap<ObjectId, ClipboardSession>,
-    send_drag: Option<DragSource>,
+    send_drags: SendDrags<DragSource>,
     send_clipboard: Option<ClipboardSource>,
     send_primary_selection: Option<PrimarySelectionSource>,
     clipboard_serial: u32,
+}
+
+/// The drags the application started that have not ended yet, oldest first.
+///
+/// A drag stays here after its drop until the target finishes it, so a new drag can start while an
+/// earlier one is still finishing.
+#[derive(Debug)]
+struct SendDrags<D> {
+    drags: Vec<D>,
+}
+
+impl<D> Default for SendDrags<D> {
+    fn default() -> Self {
+        Self { drags: Vec::new() }
+    }
+}
+
+impl<D> SendDrags<D> {
+    fn find_mut(&mut self, mut is: impl FnMut(&D) -> bool) -> Option<&mut D> {
+        self.drags.iter_mut().find(|drag| is(drag))
+    }
+
+    fn take(&mut self, mut is: impl FnMut(&D) -> bool) -> Option<D> {
+        let index = self.drags.iter().position(|drag| is(drag))?;
+        Some(self.drags.remove(index))
+    }
+
+    /// Adds a newly started drag. A seat holds one drag at a time, so an earlier drag that was
+    /// never dropped gets no further events from the compositor: those drags are removed and
+    /// returned, for the caller to end.
+    fn start(&mut self, drag: D, dropped: impl Fn(&D) -> bool) -> Vec<D> {
+        let (finishing, abandoned) =
+            mem::take(&mut self.drags).into_iter().partition(|drag| dropped(drag));
+        self.drags = finishing;
+        self.drags.push(drag);
+        abandoned
+    }
 }
 
 impl DataTransferState {
@@ -473,9 +510,7 @@ impl DataTransferState {
     }
 
     fn send_data_mut(&mut self, source: &WlDataSource) -> Option<&mut dyn DataTransferSend> {
-        if let Some(drag) =
-            self.send_drag.as_mut().filter(|drag| drag.data_source.inner() == source)
-        {
+        if let Some(drag) = self.send_drags.find_mut(|drag| drag.data_source.inner() == source) {
             return Some(drag.data.as_mut());
         }
 
@@ -663,9 +698,7 @@ impl DataSourceHandler for WinitState {
             return;
         }
 
-        let Some(current_drag) =
-            self.data_transfer_state.send_drag.take_if(|drag| drag.data_source.inner() == source)
-        else {
+        let Some(current_drag) = self.data_transfer_state.take_send_drag(source) else {
             return;
         };
 
@@ -675,41 +708,38 @@ impl DataSourceHandler for WinitState {
         self.events_sink.push_window_event(WindowEvent::OutgoingDragCanceled { id }, window_id);
     }
 
-    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
-        let Some(current_drag) = self.data_transfer_state.send_drag() else {
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        // The drop is not complete yet: the target can still refuse it, and the compositor then
+        // cancels the source. The drag ends at `dnd_finished` or at `cancelled`.
+        if let Some(drag) =
+            self.data_transfer_state.send_drags.find_mut(|drag| drag.data_source.inner() == source)
+        {
+            drag.dropped = true;
+        }
+    }
+
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        let Some(current_drag) = self.data_transfer_state.take_send_drag(source) else {
             return;
         };
 
-        let window_id = current_drag.window_id;
-        let id = current_drag.data_transfer_id;
-        let selected_action = current_drag.selected_action;
-
         self.events_sink.push_window_event(
             WindowEvent::OutgoingDragDropped {
-                id,
-                action: dnd_action_wl_to_winit(selected_action),
+                id: current_drag.data_transfer_id,
+                action: dnd_action_wl_to_winit(current_drag.selected_action),
             },
-            window_id,
+            current_drag.window_id,
         );
-    }
-
-    fn dnd_finished(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wayland_client::protocol::wl_data_source::WlDataSource,
-    ) {
-        self.data_transfer_state.clear_send_drag();
     }
 
     fn action(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlDataSource,
+        source: &WlDataSource,
         action: WlDndAction,
     ) {
-        self.data_transfer_state.set_target_drag_action(action);
+        self.data_transfer_state.set_target_drag_action(source, action);
     }
 }
 
@@ -979,6 +1009,8 @@ pub struct DragSource {
     data_source: SctkDragSource,
     data: Box<dyn DataTransferSend>,
     selected_action: WlDndAction,
+    /// Whether the drop was performed; the drag then ends when the target finishes it.
+    dropped: bool,
     window_id: WindowId,
     _icon: Option<Surface>,
 }
@@ -996,6 +1028,7 @@ impl DragSource {
             data_source,
             data,
             selected_action: WlDndAction::None,
+            dropped: false,
             window_id,
             _icon: icon,
         }
@@ -1084,8 +1117,15 @@ impl WinitState {
             surface.wl_surface().commit();
         }
 
-        self.data_transfer_state.send_drag =
-            Some(DragSource::new(transfer_id, data_source, send_data, icon_surface, source));
+        let drag = DragSource::new(transfer_id, data_source, send_data, icon_surface, source);
+        // An earlier drag that was never dropped cannot end any more: the compositor ignored its
+        // `start_drag` without cancelling it. Dropping it destroys its data source.
+        for abandoned in self.data_transfer_state.send_drags.start(drag, |drag| drag.dropped) {
+            self.events_sink.push_window_event(
+                WindowEvent::OutgoingDragCanceled { id: abandoned.data_transfer_id },
+                abandoned.window_id,
+            );
+        }
 
         Ok(transfer_id)
     }
@@ -1111,20 +1151,15 @@ impl DataTransferState {
         }
     }
 
-    fn send_drag(&self) -> Option<&DragSource> {
-        self.send_drag.as_ref()
-    }
-
-    fn set_target_drag_action(&mut self, action: WlDndAction) {
-        if let Some(source) = &mut self.send_drag {
-            source.selected_action = action;
+    fn set_target_drag_action(&mut self, source: &WlDataSource, action: WlDndAction) {
+        if let Some(drag) = self.send_drags.find_mut(|drag| drag.data_source.inner() == source) {
+            drag.selected_action = action;
         }
     }
 
-    /// Returns `true` if a drag operation was in progress, `false` if no drag operation was in
-    /// progress.
-    fn clear_send_drag(&mut self) -> bool {
-        self.send_drag.take().is_some()
+    /// Removes the drag started with `source`, which has ended.
+    fn take_send_drag(&mut self, source: &WlDataSource) -> Option<DragSource> {
+        self.send_drags.take(|drag| drag.data_source.inner() == source)
     }
 }
 
