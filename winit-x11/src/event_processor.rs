@@ -662,14 +662,13 @@ impl EventProcessor {
             return;
         }
 
-        let Some(window) = self.target.clipboard_window() else { return };
         let mut data_transfer = self.target.data_transfer_state.borrow_mut();
         let serial = {
             // Conversion needed on 32-bit targets.
             #[allow(clippy::useless_conversion)]
             u64::from(xev.selection_timestamp)
         };
-        data_transfer.request_updated_targets(clipboard, window, serial);
+        data_transfer.request_updated_targets(clipboard, serial);
     }
 
     /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not
@@ -783,8 +782,8 @@ impl EventProcessor {
         let xwindow = xev.requestor as xproto::Window;
         let property = xev.property as xproto::Atom;
 
-        // If we get a request for a window which is not ours then skip
-        if !self.window_exists(xwindow) {
+        // Our conversions are received on the selection window: anything else is not ours
+        if xwindow != self.target.data_transfer_state.get_mut().selection_window() {
             return;
         }
 
@@ -825,9 +824,7 @@ impl EventProcessor {
             || xev.target as xproto::Atom == xproto::AtomEnum::ATOM.into()
         {
             data_transfer.populate_targets(xev.selection as _, property_value);
-        } else if let Some(data) =
-            data_transfer.send_clipboard_data(xwindow, clipboard, property_value)
-        {
+        } else if let Some(data) = data_transfer.send_clipboard_data(clipboard, property_value) {
             app.window_event(&self.target, data.window(), data.into_event());
         }
     }
