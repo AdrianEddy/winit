@@ -49,6 +49,13 @@ atom_manager! {
     ATOM_PAIR,
     CLIPBOARD,
     INCR,
+    NULL,
+
+    // Clipboard manager atoms (freedesktop clipboard manager specification)
+    CLIPBOARD_MANAGER,
+    SAVE_TARGETS,
+    // The property the targets to save are listed in
+    WINIT_SAVE_TARGETS,
 
     // Assorted ICCCM Atoms
     _NET_WM_ICON,

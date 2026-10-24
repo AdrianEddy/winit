@@ -33,7 +33,7 @@ use winit_core::event_loop::{
 };
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
 use winit_core::window::{Theme, Window as CoreWindow, WindowAttributes, WindowId};
-use x11rb::connection::RequestConnection;
+use x11rb::connection::{Connection as _, RequestConnection};
 use x11rb::errors::{ConnectError, ConnectionError, IdsExhausted, ReplyError};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::{ErrorKind, xkb, xproto};
@@ -44,7 +44,7 @@ use crate::atoms::{
     _NET_WM_PING, _NET_WM_SYNC_REQUEST, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y, Atoms,
     WM_DELETE_WINDOW,
 };
-use crate::data_transfer::{ClipboardSelectionType, DataTransferState};
+use crate::data_transfer::{ClipboardSelectionType, DataTransferState, HandOffOutcome};
 use crate::event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use crate::ime::{self, Ime, ImeCreationError, ImeSender};
 use crate::util::{self, CustomCursor};
@@ -509,10 +509,77 @@ impl EventLoop {
         }
         if let Some(code) = self.exit_code() {
             self.loop_running = false;
+            self.hand_off_clipboard();
 
             PumpStatus::Exit(code)
         } else {
             PumpStatus::Continue
+        }
+    }
+
+    /// Hand the clipboard this application owns over to the clipboard manager, if there is one,
+    /// so that it outlives the application (freedesktop clipboard manager specification).
+    ///
+    /// The manager's requests are served until it replies, goes away or takes longer than five
+    /// seconds; other events stay queued, for the event loop may run again. This runs once the
+    /// event loop exits, and once more when it is dropped, for the contents that were not handed
+    /// over yet.
+    fn hand_off_clipboard(&mut self) {
+        let Some(hand_off) =
+            self.event_processor.target.data_transfer_state.get_mut().start_clipboard_hand_off()
+        else {
+            return;
+        };
+
+        // XFixesSelectionNotify is the first XFixes event.
+        let xfixes_selection_notify = self.event_processor.xfixesext.first_event as c_int;
+        let mut incr_properties = Vec::new();
+        let outcome = 'wait: loop {
+            let mut event = MaybeUninit::uninit();
+            loop {
+                // The INCR transfers in progress, which the requests served so far may have
+                // started.
+                let data_transfer = self.event_processor.target.data_transfer_state.get_mut();
+                incr_properties.clear();
+                incr_properties.extend(data_transfer.incr_send_properties());
+
+                let Some(xev) = self.event_processor.poll_one_event_matching(&mut event, |xev| {
+                    hand_off.takes(xev, xfixes_selection_notify, &incr_properties)
+                }) else {
+                    break;
+                };
+                if let Some(outcome) = self.event_processor.clipboard_hand_off_event(xev, &hand_off)
+                {
+                    break 'wait Some(outcome);
+                }
+                // A steady flow of requests does not keep the exit waiting past the deadline.
+                if hand_off.remaining(Instant::now()).is_none() {
+                    break 'wait None;
+                }
+            }
+
+            let Some(remaining) = hand_off.remaining(Instant::now()) else {
+                break None;
+            };
+            // Send our replies, then wait for the X connection to become readable: the queue may
+            // hold the events left for the event loop, so it cannot tell that new ones arrived.
+            if let Err(err) = self.event_processor.target.xconn.xcb_connection().flush() {
+                warn!("Failed to flush the X connection while handing the clipboard over: {err}");
+                return;
+            }
+            if let Err(err) = self.event_loop.dispatch(Some(remaining), &mut self.state) {
+                warn!("Failed to wait for the clipboard manager: {err}");
+                return;
+            }
+        };
+
+        match outcome {
+            Some(HandOffOutcome::Saved) => debug!("The clipboard manager saved the clipboard"),
+            Some(HandOffOutcome::Refused) => {
+                warn!("The clipboard manager could not save the clipboard")
+            },
+            Some(HandOffOutcome::ManagerGone) => warn!("The clipboard manager went away"),
+            None => warn!("The clipboard manager did not save the clipboard in time"),
         }
     }
 
@@ -706,6 +773,16 @@ impl EventLoopProvider for EventLoop {
         custom_cursor: CustomCursorSource,
     ) -> Result<CoreCustomCursor, CustomCursorError> {
         self.window_target().create_custom_cursor(custom_cursor)
+    }
+}
+
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        // For an event loop that is dropped without having exited, but not while unwinding from a
+        // panic, which a panic while serving the manager would turn into an abort.
+        if !std::thread::panicking() {
+            self.hand_off_clipboard();
+        }
     }
 }
 

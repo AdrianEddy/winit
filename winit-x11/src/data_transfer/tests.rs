@@ -1,7 +1,7 @@
 //! Unit tests for the selection and drag-and-drop logic that runs without an X server.
 
 use std::cell::RefCell;
-use std::ptr;
+use std::{mem, ptr};
 
 use winit_core::data_transfer::{DataTransferSend, DataTransferSendBuilder, TypeHint};
 use x11_dl::xlib::XSelectionRequestEvent;
@@ -18,6 +18,9 @@ const TEXT_PLAIN_UTF8_ATOM: xproto::Atom = 106;
 const IMAGE_PNG_ATOM: xproto::Atom = 107;
 const MULTIPLE_ATOM: xproto::Atom = 108;
 const INCR_ATOM: xproto::Atom = 109;
+const SAVE_TARGETS_ATOM: xproto::Atom = 110;
+const CLIPBOARD_MANAGER_ATOM: xproto::Atom = 111;
+const CLIPBOARD_SELECTION: ClipboardSelectionType = ClipboardSelectionType::Clipboard;
 
 /// The atoms the tests use, each with its own value; every other atom is 0, which no test uses.
 fn atoms() -> Atoms {
@@ -25,6 +28,8 @@ fn atoms() -> Atoms {
         TARGETS: TARGETS_ATOM,
         TIMESTAMP: TIMESTAMP_ATOM,
         MULTIPLE: MULTIPLE_ATOM,
+        SAVE_TARGETS: SAVE_TARGETS_ATOM,
+        CLIPBOARD_MANAGER: CLIPBOARD_MANAGER_ATOM,
         UTF8_STRING: UTF8_STRING_ATOM,
         STRING: STRING_ATOM,
         TextPlain: TEXT_PLAIN_ATOM,
@@ -34,12 +39,16 @@ fn atoms() -> Atoms {
     }
 }
 
+/// Plain text contents of ours.
+fn text_contents(text: &'static str) -> Box<dyn DataTransferSend> {
+    DataTransferSendBuilder::new(())
+        .with_type(TypeHint::Plaintext, move |_, _| Some(text.to_owned()))
+        .build()
+}
+
 /// A clipboard owned by this application, offering `text` as plain text.
 fn owned_text(text: &'static str) -> ClipboardState {
-    let send: Box<dyn DataTransferSend> = DataTransferSendBuilder::new(())
-        .with_type(TypeHint::Plaintext, move |_, _| Some(text.to_owned()))
-        .build();
-    ClipboardState { owned_data: Some(send), ..Default::default() }
+    ClipboardState { owned_data: Some(text_contents(text)), ..Default::default() }
 }
 
 fn selection_request(target: xproto::Atom, property: xproto::Atom) -> XSelectionRequestEvent {
@@ -89,22 +98,33 @@ fn a_selection_without_owned_data_refuses_every_conversion() {
     let state = ClipboardState::default();
     let atoms = atoms();
 
-    assert_eq!(state.plan_conversion(&atoms, TARGETS_ATOM, 1024), ReplyPlan::Refuse);
-    assert_eq!(state.plan_conversion(&atoms, UTF8_STRING_ATOM, 1024), ReplyPlan::Refuse);
+    assert_eq!(
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, TARGETS_ATOM, 1024),
+        ReplyPlan::Refuse
+    );
+    assert_eq!(
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, UTF8_STRING_ATOM, 1024),
+        ReplyPlan::Refuse
+    );
 }
 
 #[test]
 fn a_conversion_to_a_type_that_is_not_offered_is_refused() {
     let state = owned_text("hello");
 
-    assert_eq!(state.plan_conversion(&atoms(), IMAGE_PNG_ATOM, 1024), ReplyPlan::Refuse);
+    assert_eq!(
+        state.plan_conversion(&atoms(), CLIPBOARD_SELECTION, IMAGE_PNG_ATOM, 1024),
+        ReplyPlan::Refuse
+    );
 }
 
 #[test]
 fn targets_lists_the_required_targets_and_the_offered_types() {
     let state = owned_text("hello");
 
-    let ReplyPlan::Targets(targets) = state.plan_conversion(&atoms(), TARGETS_ATOM, 1024) else {
+    let ReplyPlan::Targets(targets) =
+        state.plan_conversion(&atoms(), CLIPBOARD_SELECTION, TARGETS_ATOM, 1024)
+    else {
         panic!("TARGETS should be answered with a list of targets");
     };
     assert_eq!(&targets[..3], &[TIMESTAMP_ATOM, TARGETS_ATOM, MULTIPLE_ATOM]);
@@ -118,7 +138,10 @@ fn targets_lists_the_required_targets_and_the_offered_types() {
 fn timestamp_is_answered() {
     let state = owned_text("hello");
 
-    assert_eq!(state.plan_conversion(&atoms(), TIMESTAMP_ATOM, 1024), ReplyPlan::Timestamp);
+    assert_eq!(
+        state.plan_conversion(&atoms(), CLIPBOARD_SELECTION, TIMESTAMP_ATOM, 1024),
+        ReplyPlan::Timestamp
+    );
 }
 
 #[test]
@@ -127,11 +150,11 @@ fn small_data_is_stored_directly_and_large_data_incrementally() {
     let utf8 = SelectionType { hint: Some(TypeHint::Plaintext), atom: UTF8_STRING_ATOM };
 
     assert_eq!(
-        state.plan_conversion(&atoms(), UTF8_STRING_ATOM, 6),
+        state.plan_conversion(&atoms(), CLIPBOARD_SELECTION, UTF8_STRING_ATOM, 6),
         ReplyPlan::Direct(utf8.clone(), b"hello".to_vec())
     );
     assert_eq!(
-        state.plan_conversion(&atoms(), UTF8_STRING_ATOM, 5),
+        state.plan_conversion(&atoms(), CLIPBOARD_SELECTION, UTF8_STRING_ATOM, 5),
         ReplyPlan::Incr(utf8, b"hello".to_vec())
     );
 }
@@ -820,7 +843,7 @@ fn our_plain_text_is_read_from_a_utf8_target_whatever_the_order_of_our_types() {
 #[test]
 fn our_targets_list_utf8_text_before_string() {
     let ReplyPlan::Targets(targets) =
-        owned_text("text").plan_conversion(&atoms(), TARGETS_ATOM, 1024)
+        owned_text("text").plan_conversion(&atoms(), CLIPBOARD_SELECTION, TARGETS_ATOM, 1024)
     else {
         panic!("TARGETS should be answered with a list of targets");
     };
@@ -838,7 +861,9 @@ fn our_plain_text_is_pasted_back_unchanged() {
 
     // What a paste of our own clipboard does: pick the type, convert, receive.
     let ty = state.find_type_by_hint(TypeHint::Plaintext, &atoms).expect("text is offered");
-    let ReplyPlan::Direct(_, data) = state.plan_conversion(&atoms, ty.atom(), 1024) else {
+    let ReplyPlan::Direct(_, data) =
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, ty.atom(), 1024)
+    else {
         panic!("{ty:?} should be stored directly");
     };
     let mut queue = FetchQueue::default();
@@ -859,7 +884,7 @@ fn plain_text_given_as_bytes_is_answered_in_latin1_for_string() {
             .with_type(TypeHint::Plaintext, move |_, _| Some(bytes.to_vec()))
             .build();
         let state = ClipboardState { owned_data: Some(send), ..Default::default() };
-        match state.plan_conversion(&atoms, target, 1024) {
+        match state.plan_conversion(&atoms, CLIPBOARD_SELECTION, target, 1024) {
             ReplyPlan::Direct(_, data) => data,
             plan => panic!("{plan:?}"),
         }
@@ -891,13 +916,201 @@ fn a_string_request_is_answered_in_latin1() {
     let state = owned_text("café ☃");
     let atoms = atoms();
 
-    let ReplyPlan::Direct(_, latin1) = state.plan_conversion(&atoms, STRING_ATOM, 1024) else {
+    let ReplyPlan::Direct(_, latin1) =
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, STRING_ATOM, 1024)
+    else {
         panic!("STRING is offered with plain text");
     };
     assert_eq!(latin1, b"caf\xe9 ?");
 
-    let ReplyPlan::Direct(_, utf8) = state.plan_conversion(&atoms, UTF8_STRING_ATOM, 1024) else {
+    let ReplyPlan::Direct(_, utf8) =
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, UTF8_STRING_ATOM, 1024)
+    else {
         panic!("UTF8_STRING is offered with plain text");
     };
     assert_eq!(utf8, "café ☃".as_bytes());
+}
+
+#[test]
+fn save_targets_is_advertised_and_answered_as_a_side_effect() {
+    let state = owned_text("hello");
+    let atoms = atoms();
+
+    let ReplyPlan::Targets(targets) =
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, TARGETS_ATOM, 1024)
+    else {
+        panic!("TARGETS should be answered with a list of targets");
+    };
+    assert!(targets.contains(&SAVE_TARGETS_ATOM));
+    assert_eq!(
+        state.plan_conversion(&atoms, CLIPBOARD_SELECTION, SAVE_TARGETS_ATOM, 1024),
+        ReplyPlan::SideEffect
+    );
+}
+
+#[test]
+fn save_targets_is_neither_advertised_nor_answered_for_the_primary_selection() {
+    let state = owned_text("hello");
+    let atoms = atoms();
+    let primary = ClipboardSelectionType::Primary;
+
+    let ReplyPlan::Targets(targets) = state.plan_conversion(&atoms, primary, TARGETS_ATOM, 1024)
+    else {
+        panic!("TARGETS should be answered with a list of targets");
+    };
+    assert!(!targets.contains(&SAVE_TARGETS_ATOM), "{targets:?}");
+    assert_eq!(state.plan_conversion(&atoms, primary, SAVE_TARGETS_ATOM, 1024), ReplyPlan::Refuse);
+}
+
+#[test]
+fn a_clear_generated_before_new_contents_were_published_is_ignored() {
+    let mut state = ClipboardState::default();
+    // Contents published by our request 100, then handed over to the clipboard manager as the
+    // event loop exits: the server generates a SelectionClear after our request 105.
+    state.publish(text_contents("handed over"), 100);
+    let clear_of_the_handed_over_contents = 105;
+    // The event loop runs again, and publishes new contents before that SelectionClear is read.
+    state.publish(text_contents("new"), 110);
+
+    assert!(!state.clear(clear_of_the_handed_over_contents), "a stale clear is ignored");
+    assert!(state.owned_data.is_some(), "the new contents are kept");
+
+    assert!(state.clear(111), "a clear after the new contents were published takes them");
+    assert!(state.owned_data.is_none());
+}
+
+#[test]
+fn a_clear_is_placed_before_or_after_our_contents_across_sequence_wrap() {
+    let mut state = ClipboardState::default();
+    // Published by a request whose sequence number wrapped around the 32 bits events carry.
+    state.publish(text_contents("text"), (1 << 32) + 5);
+
+    assert!(!state.clear(u64::from(u32::MAX) - 2), "generated before the wrap");
+    assert!(state.clear(7), "generated after it");
+}
+
+#[test]
+fn the_clipboard_manager_is_asked_to_save_the_data_targets_only() {
+    let not_data = [TARGETS_ATOM, TIMESTAMP_ATOM, MULTIPLE_ATOM, SAVE_TARGETS_ATOM];
+    let advertised = [
+        TIMESTAMP_ATOM,
+        TARGETS_ATOM,
+        MULTIPLE_ATOM,
+        SAVE_TARGETS_ATOM,
+        UTF8_STRING_ATOM,
+        STRING_ATOM,
+    ];
+
+    assert_eq!(save_targets_list(&advertised, &not_data), [UTF8_STRING_ATOM, STRING_ATOM]);
+}
+
+/// A hand-over from the selection window 9, with five seconds left.
+fn hand_off(now: Instant) -> ClipboardHandOff {
+    ClipboardHandOff {
+        requestor: 9,
+        manager: CLIPBOARD_MANAGER_ATOM,
+        save_targets: SAVE_TARGETS_ATOM,
+        deadline: now + CLIPBOARD_MANAGER_TIMEOUT,
+    }
+}
+
+#[test]
+fn the_hand_off_ends_with_the_reply_of_the_manager() {
+    let hand_off = hand_off(Instant::now());
+    let (manager, save) = (CLIPBOARD_MANAGER_ATOM, SAVE_TARGETS_ATOM);
+
+    assert_eq!(hand_off.reply(9, manager, save, 77), Some(HandOffOutcome::Saved));
+    assert_eq!(hand_off.reply(9, manager, save, x11rb::NONE), Some(HandOffOutcome::Refused));
+    assert_eq!(hand_off.reply(8, manager, save, 77), None, "another requestor");
+    assert_eq!(hand_off.reply(9, 13, save, 77), None, "another selection");
+    assert_eq!(hand_off.reply(9, manager, TARGETS_ATOM, 77), None, "another target");
+}
+
+#[test]
+fn the_hand_off_waits_no_longer_than_its_deadline() {
+    let now = Instant::now();
+    let hand_off = hand_off(now);
+
+    assert_eq!(hand_off.remaining(now), Some(CLIPBOARD_MANAGER_TIMEOUT));
+    assert_eq!(hand_off.remaining(now + CLIPBOARD_MANAGER_TIMEOUT), None);
+    assert_eq!(hand_off.remaining(now + 2 * CLIPBOARD_MANAGER_TIMEOUT), None);
+}
+
+/// An X event of type `ty`, as the event structure `T` with the fields that `set` fills in.
+fn x_event<T>(ty: c_int, set: impl FnOnce(&mut T)) -> XEvent {
+    assert!(mem::size_of::<T>() <= mem::size_of::<XEvent>());
+    // SAFETY: X events are plain C data, valid when zeroed, and `T` fits in `XEvent`.
+    let mut event: XEvent = unsafe { mem::zeroed() };
+    set(unsafe { &mut *(&mut event as *mut XEvent).cast::<T>() });
+    event.type_ = ty;
+    event
+}
+
+#[test]
+fn the_hand_off_takes_only_its_own_events_from_the_queue() {
+    const XFIXES_SELECTION_NOTIFY: c_int = 87;
+    const CLIPBOARD_ATOM: xproto::Atom = 13;
+    let hand_off = hand_off(Instant::now());
+    // The property of our INCR transfer in progress.
+    const INCR_PROPERTY: xproto::Atom = 50;
+    let takes = |event: XEvent| hand_off.takes(&event, XFIXES_SELECTION_NOTIFY, &[INCR_PROPERTY]);
+
+    let request = x_event(xlib::SelectionRequest, |_: &mut XSelectionRequestEvent| {});
+    assert!(takes(request), "a request for our selections");
+
+    let property = |atom: xproto::Atom, state| {
+        x_event(xlib::PropertyNotify, |ev: &mut XPropertyEvent| {
+            (ev.atom, ev.state) = (atom as _, state);
+        })
+    };
+    let (delete, new_value) = (xlib::PropertyDelete, xlib::PropertyNewValue);
+    assert!(takes(property(INCR_PROPERTY, delete)), "a deletion that our INCR transfer waits for");
+    assert!(!takes(property(51, delete)), "the deletion of another property");
+    assert!(!takes(property(INCR_PROPERTY, new_value)), "a new property value");
+
+    let notify = |selection: xproto::Atom, target: xproto::Atom| {
+        x_event(xlib::SelectionNotify, |ev: &mut XSelectionEvent| {
+            (ev.requestor, ev.selection, ev.target, ev.property) =
+                (9, selection as _, target as _, 77);
+        })
+    };
+    assert!(takes(notify(CLIPBOARD_MANAGER_ATOM, SAVE_TARGETS_ATOM)), "the manager's reply");
+    assert!(!takes(notify(CLIPBOARD_ATOM, UTF8_STRING_ATOM)), "the reply to a fetch");
+
+    let owner_change = |selection: xproto::Atom| {
+        x_event(XFIXES_SELECTION_NOTIFY, |ev: &mut XFixesSelectionNotifyEvent| {
+            ev.selection = selection as _;
+        })
+    };
+    assert!(takes(owner_change(CLIPBOARD_MANAGER_ATOM)), "the manager's departure");
+    assert!(!takes(owner_change(CLIPBOARD_ATOM)), "a change of the clipboard's owner");
+
+    let clear = x_event(xlib::SelectionClear, |_: &mut xlib::XSelectionClearEvent| {});
+    assert!(!takes(clear), "the loss of a selection");
+    assert!(!takes(x_event(xlib::KeyPress, |_: &mut xlib::XKeyEvent| {})), "input");
+}
+
+#[test]
+fn the_clipboard_is_handed_off_once_per_contents() {
+    let state = owned_text("ours");
+    let contents = state.transfer_serial;
+
+    assert_eq!(state.contents_to_hand_off(None), Some(contents));
+    assert_eq!(state.contents_to_hand_off(Some(contents)), None);
+    assert_eq!(
+        state.contents_to_hand_off(Some(DataTransferId::from_raw(-1))),
+        Some(contents),
+        "new contents are handed off again"
+    );
+    assert_eq!(ClipboardState::default().contents_to_hand_off(None), None, "not ours");
+}
+
+#[test]
+fn contents_are_marked_handed_off_only_when_ours_and_a_manager_is_there() {
+    let (ours, another_client, manager) = (9, 8, 30);
+
+    assert!(hand_off_proceeds(Some(ours), ours, Some(manager)));
+    assert!(!hand_off_proceeds(Some(ours), ours, None), "no manager yet: handed off later");
+    assert!(!hand_off_proceeds(Some(another_client), ours, Some(manager)), "taken by another");
+    assert!(!hand_off_proceeds(None, ours, Some(manager)), "the clipboard has no owner");
 }

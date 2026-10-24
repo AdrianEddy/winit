@@ -83,6 +83,11 @@ pub trait EventLoopExtPumpEvents {
     /// - **Windows**: The implementation will use `PeekMessage` when checking for window messages
     ///   to avoid blocking your external event loop.
     ///
+    /// - **X11**: When the application owns the clipboard as the loop exits (the call that returns
+    ///   `PumpStatus::Exit`), the clipboard is handed over to the clipboard manager, if one is
+    ///   running, so that it outlives the application: that call waits for the manager to save it,
+    ///   for up to 5 seconds.
+    ///
     /// - **MacOS**: The implementation works in terms of stopping the global application whenever
     ///   the application `RunLoop` indicates that it is preparing to block and wait for new events.
     ///

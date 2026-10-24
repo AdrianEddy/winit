@@ -35,6 +35,12 @@ use crate::platform_impl;
 /// the [`Window`] created from this _can_ be sent to an other thread, and the
 /// [`EventLoopProxy`] allows you to wake up an `EventLoop` from another thread.
 ///
+/// ## Platform-specific
+///
+/// - **X11:** When the event loop exits, or is dropped, while the application owns the clipboard,
+///   the clipboard is handed over to the clipboard manager, if one is running, so that it outlives
+///   the application. Exiting or dropping it waits for the manager to save it, for up to 5 seconds.
+///
 /// [`Window`]: crate::window::Window
 #[derive(Debug)]
 pub struct EventLoop {

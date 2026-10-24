@@ -18,7 +18,7 @@ use x11rb::{CURRENT_TIME, resource_manager};
 use super::atoms::Atoms;
 use super::ffi;
 use super::monitor::MonitorHandle;
-use crate::event_loop::{CookieResultExt as _, X11Error};
+use crate::event_loop::X11Error;
 
 /// A connection to an X server.
 pub struct XConnection {
@@ -375,9 +375,10 @@ impl XConnection {
     }
 
     /// Sets the owner of the [`SelectionType`] so applications requesting it will send an
-    /// [`xproto::SelectionRequestEvent`] event to us.
-    pub fn set_selection_owner(&self, xwindow: xproto::Window, selection: xproto::Atom) {
-        self.xcb_connection()
+    /// [`xproto::SelectionRequestEvent`] event to us. Returns the sequence number of the request.
+    pub fn set_selection_owner(&self, xwindow: xproto::Window, selection: xproto::Atom) -> u64 {
+        let cookie = self
+            .xcb_connection()
             .set_selection_owner(
                 xwindow,
                 selection,
@@ -385,7 +386,10 @@ impl XConnection {
                 // to matter https://xorg.freedesktop.org/archive/X11R7.6/doc/xorg-docs/specs/ICCCM/icccm.html#acquiring_selection_ownership
                 CURRENT_TIME,
             )
-            .expect_then_ignore_error("Failed to send SetSelectionOwner event")
+            .expect("Failed to send SetSelectionOwner event");
+        let sequence = cookie.sequence_number();
+        cookie.ignore_error();
+        sequence
     }
 
     /// Gets a user readable string of the atom:

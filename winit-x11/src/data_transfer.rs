@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::os::raw::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 use std::{fmt, io};
 
 use winit_core::data_transfer::{
@@ -15,7 +16,8 @@ use winit_core::error::TransferError;
 use winit_core::event::WindowEvent;
 use winit_core::event_loop::AsyncRequestSerial;
 use winit_core::window::WindowId;
-use x11_dl::xlib::{XPropertyEvent, XSelectionEvent, XSelectionRequestEvent};
+use x11_dl::xfixes::XFixesSelectionNotifyEvent;
+use x11_dl::xlib::{self, XEvent, XPropertyEvent, XSelectionEvent, XSelectionRequestEvent};
 use x11rb::CURRENT_TIME;
 use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::errors::ReplyError;
@@ -286,6 +288,9 @@ pub struct ClipboardState {
     targets_request: Option<Request>,
     /// The fetches of the selection's data, the first one being in progress
     fetches: FetchQueue,
+    /// The sequence number of our latest `SetSelectionOwner` request, which published
+    /// `owned_data`.
+    owner_sequence: Option<u64>,
 }
 
 impl Default for ClipboardState {
@@ -297,6 +302,7 @@ impl Default for ClipboardState {
             types: Default::default(),
             targets_request: None,
             fetches: Default::default(),
+            owner_sequence: None,
         }
     }
 }
@@ -837,6 +843,42 @@ impl ClipboardState {
         self.fetches.abandon_while(|_| true, why)
     }
 
+    /// Take `send_data` as our contents, published by the `SetSelectionOwner` request
+    /// `owner_sequence`.
+    pub(crate) fn publish(&mut self, send_data: Box<dyn DataTransferSend>, owner_sequence: u64) {
+        // The contents change: the transfer id of the previous ones no longer names them.
+        self.transfer_serial = generate_transfer_id();
+        self.owned_data = Some(send_data);
+        self.owner_sequence = Some(owner_sequence);
+    }
+
+    /// Handle a `SelectionClear` that the server generated once it had processed our request
+    /// `event_serial`: returns whether it took our contents, which it then drops.
+    ///
+    /// One generated before our latest `SetSelectionOwner` took contents that were replaced
+    /// since, e.g. handed over to a clipboard manager while the event loop exited, and is
+    /// ignored. Sequence numbers are compared in the 32 bits that X events carry, wrapping
+    /// around.
+    pub(crate) fn clear(&mut self, event_serial: u64) -> bool {
+        let stale = self.owner_sequence.is_some_and(|sequence| {
+            ((event_serial as u32).wrapping_sub(sequence as u32) as i32) < 0
+        });
+        if !stale {
+            self.owned_data = None;
+        }
+        !stale
+    }
+
+    /// The transfer id of the contents to hand over to a clipboard manager: those that this
+    /// application owns, unless they were already handed over (`handed_off`).
+    pub(crate) fn contents_to_hand_off(
+        &self,
+        handed_off: Option<DataTransferId>,
+    ) -> Option<DataTransferId> {
+        self.owned_data.as_ref()?;
+        Some(self.transfer_serial).filter(|&contents| handed_off != Some(contents))
+    }
+
     /// The type to read for `hint` among the types available on the clipboard, as
     /// [`preferred_type`] chooses, whether the contents are ours or another client's.
     pub fn find_type_by_hint(&self, hint: TypeHint, atoms: &Atoms) -> Option<SelectionType> {
@@ -855,7 +897,8 @@ impl ClipboardState {
         }
     }
 
-    /// Decide how to answer another client's request to convert this selection to `target`.
+    /// Decide how to answer another client's request to convert this selection, `selection`, to
+    /// `target`.
     ///
     /// A conversion that cannot be made is refused, which the requestor learns from a
     /// `SelectionNotify` whose property is `None` (ICCCM, "Responsibilities of the Selection
@@ -863,17 +906,22 @@ impl ClipboardState {
     pub(crate) fn plan_conversion(
         &self,
         atoms: &Atoms,
+        selection: ClipboardSelectionType,
         target: xproto::Atom,
         incr_threshold: usize,
     ) -> ReplyPlan {
         let Some(owned_data) = &self.owned_data else {
             return ReplyPlan::Refuse;
         };
+        // The freedesktop clipboard manager specification covers CLIPBOARD only.
+        let hands_off = selection == ClipboardSelectionType::Clipboard;
 
         if target == atoms[TARGETS] {
             // We must advertise at least TIMESTAMP, TARGETS and MULTIPLE, which ICCCM requires
-            // every owner to support.
+            // every owner to support. SAVE_TARGETS tells clipboard managers that we hand the
+            // clipboard over to them.
             let mut targets = vec![atoms[TIMESTAMP], atoms[TARGETS], atoms[MULTIPLE]];
+            targets.extend(hands_off.then_some(atoms[SAVE_TARGETS]));
 
             // Add user defined types if possible
             owned_data.for_each_available_type(&mut |ty| {
@@ -884,6 +932,9 @@ impl ClipboardState {
             ReplyPlan::Targets(targets)
         } else if target == atoms[TIMESTAMP] {
             ReplyPlan::Timestamp
+        } else if target == atoms[SAVE_TARGETS] && hands_off {
+            // A marker target: converting to it has no effect.
+            ReplyPlan::SideEffect
         } else {
             let ty = SelectionType::new(atoms, target);
             let data = match owned_data.data_for_type(&ty) {
@@ -924,6 +975,9 @@ pub(crate) enum ReplyPlan {
     Direct(SelectionType, Vec<u8>),
     /// Send the data incrementally, with the `INCR` mechanism.
     Incr(SelectionType, Vec<u8>),
+    /// Answer a target whose conversion is a side effect, with an empty property of type `NULL`
+    /// (ICCCM).
+    SideEffect,
     /// Refuse the conversion.
     Refuse,
 }
@@ -982,6 +1036,113 @@ pub(crate) fn selection_notify_reply(
     }
 }
 
+/// How long the clipboard manager is given to save the clipboard when the event loop ends.
+pub(crate) const CLIPBOARD_MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A hand-over of the clipboard to the clipboard manager, waiting for the manager's reply
+/// (freedesktop clipboard manager specification).
+#[derive(Debug)]
+pub(crate) struct ClipboardHandOff {
+    /// The window that asked the manager to save the clipboard.
+    requestor: xproto::Window,
+    /// `CLIPBOARD_MANAGER`, the manager's selection.
+    manager: xproto::Atom,
+    /// `SAVE_TARGETS`, the target the manager's selection was converted to.
+    save_targets: xproto::Atom,
+    /// When to stop waiting for the reply.
+    deadline: Instant,
+}
+
+/// How a hand-over of the clipboard ended, short of its deadline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HandOffOutcome {
+    /// The manager saved the clipboard.
+    Saved,
+    /// The manager could not save it.
+    Refused,
+    /// The manager went away.
+    ManagerGone,
+}
+
+impl ClipboardHandOff {
+    /// The outcome that a `SelectionNotify` brings, if it is the manager's reply.
+    pub(crate) fn reply(
+        &self,
+        requestor: xproto::Window,
+        selection: xproto::Atom,
+        target: xproto::Atom,
+        property: xproto::Atom,
+    ) -> Option<HandOffOutcome> {
+        let answers =
+            requestor == self.requestor && selection == self.manager && target == self.save_targets;
+        answers.then_some(if property == x11rb::NONE {
+            HandOffOutcome::Refused
+        } else {
+            HandOffOutcome::Saved
+        })
+    }
+
+    /// The time left to wait for the manager's reply, if any.
+    pub(crate) fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.deadline.checked_duration_since(now).filter(|remaining| !remaining.is_zero())
+    }
+
+    /// Whether the hand-over takes `event` from the event queue: the requests for our selections
+    /// and the deletions of the properties that our INCR transfers wait for (`incr_properties`),
+    /// which it serves, and the manager's reply and departure, which end it
+    /// (`xfixes_selection_notify` is the type of XFixes selection events). Other events stay
+    /// queued for the event loop, which may run again.
+    pub(crate) fn takes(
+        &self,
+        event: &XEvent,
+        xfixes_selection_notify: c_int,
+        incr_properties: &[xproto::Atom],
+    ) -> bool {
+        match event.get_type() {
+            xlib::SelectionRequest => true,
+            xlib::PropertyNotify => {
+                let event: &XPropertyEvent = event.as_ref();
+                event.state == xlib::PropertyDelete
+                    && incr_properties.contains(&(event.atom as xproto::Atom))
+            },
+            xlib::SelectionNotify => {
+                let event: &XSelectionEvent = event.as_ref();
+                let (requestor, selection) = (event.requestor as _, event.selection as _);
+                self.reply(requestor, selection, event.target as _, event.property as _).is_some()
+            },
+            ty if ty == xfixes_selection_notify => {
+                // SAFETY: an event of this type is an XFixes selection event, which `XEvent`'s
+                // padding holds.
+                let event =
+                    unsafe { &*(event as *const XEvent).cast::<XFixesSelectionNotifyEvent>() };
+                event.selection as xproto::Atom == self.manager
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Whether our contents are handed over to the clipboard manager now, which marks them handed off:
+/// only if CLIPBOARD is still ours, its owner as the server reports it being `clipboard_owner`,
+/// and a clipboard manager owns `CLIPBOARD_MANAGER` (`manager`). Contents that no manager was there
+/// for stay unmarked, to be handed over when the event loop next exits or is dropped.
+pub(crate) fn hand_off_proceeds(
+    clipboard_owner: Option<xproto::Window>,
+    selection_window: xproto::Window,
+    manager: Option<xproto::Window>,
+) -> bool {
+    clipboard_owner == Some(selection_window) && manager.is_some()
+}
+
+/// The targets to ask the clipboard manager to save: the advertised ones, without those that are
+/// not data (`not_data`).
+pub(crate) fn save_targets_list(
+    advertised: &[xproto::Atom],
+    not_data: &[xproto::Atom],
+) -> Vec<xproto::Atom> {
+    advertised.iter().copied().filter(|target| !not_data.contains(target)).collect()
+}
+
 #[derive(Debug)]
 pub struct DataTransferState {
     xconn: Arc<XConnection>,
@@ -1001,6 +1162,8 @@ pub struct DataTransferState {
     incr_threshold: usize,
     /// The properties that conversions store their replies in.
     properties: PropertyPool,
+    /// The transfer id of the clipboard contents last handed over to the clipboard manager.
+    clipboard_handed_off: Option<DataTransferId>,
 }
 
 #[derive(Debug)]
@@ -1170,6 +1333,7 @@ impl DataTransferState {
             clip_incr_receive: Default::default(),
             incr_threshold: incr_threshold(conn.maximum_request_bytes()),
             properties: PropertyPool { atoms: Vec::new(), next: 0 },
+            clipboard_handed_off: None,
         };
 
         // Listen for all selection owner changes for the clipboard. This is a bit hacky but we must
@@ -1393,8 +1557,12 @@ impl DataTransferState {
     ) -> bool {
         let atoms = self.xconn.atoms();
         let replace = xproto::PropMode::REPLACE;
-        let plan =
-            self.get_clipboard(clipboard).plan_conversion(atoms, target, self.incr_threshold);
+        let plan = self.get_clipboard(clipboard).plan_conversion(
+            atoms,
+            clipboard,
+            target,
+            self.incr_threshold,
+        );
 
         let stored = match plan {
             ReplyPlan::Refuse => {
@@ -1428,6 +1596,9 @@ impl DataTransferState {
                 replace,
                 &[CURRENT_TIME],
             ),
+            ReplyPlan::SideEffect => {
+                self.xconn.change_property::<u8>(requestor, property, atoms[NULL], replace, &[])
+            },
             ReplyPlan::Direct(ty, data) => {
                 self.xconn.change_property(requestor, property, ty.atom(), replace, &data)
             },
@@ -1701,6 +1872,11 @@ impl DataTransferState {
         abandoned
     }
 
+    /// The properties that our INCR transfers in progress wait for the deletion of.
+    pub(crate) fn incr_send_properties(&self) -> impl Iterator<Item = xproto::Atom> + '_ {
+        self.clip_incr_send.iter().map(|send| send.property)
+    }
+
     /// Check if we are the ones sending and the receiver deleted their property for the clipboard
     /// then update
     pub fn check_incr_send_data(&mut self, xev: &XPropertyEvent) {
@@ -1796,16 +1972,20 @@ impl DataTransferState {
         }
     }
 
-    /// Handle a `SelectionClear`: another client took a selection we owned. Returns the
-    /// fetches that the change abandons.
+    /// Handle a `SelectionClear`, generated once the server had processed our request
+    /// `event_serial`: another client took a selection we owned. Returns the fetches that the
+    /// change abandons.
     #[must_use]
     pub fn selection_cleared(
         &mut self,
         clipboard: ClipboardSelectionType,
+        event_serial: u64,
     ) -> Vec<FinishedDataTransfer> {
-        if self.get_clipboard_mut(clipboard).owned_data.take().is_some() {
-            trace!("Cleared owned data for {clipboard:?}")
+        if !self.get_clipboard_mut(clipboard).clear(event_serial) {
+            debug!("Ignoring a SelectionClear of {clipboard:?} that predates our contents");
+            return Vec::new();
         }
+        trace!("Cleared owned data for {clipboard:?}");
         self.clip_incr_send.retain(|send| send.clipboard != clipboard);
         self.abandon_clipboard(clipboard, "the selection changed hands")
     }
@@ -1826,6 +2006,78 @@ impl DataTransferState {
         Ok(())
     }
 
+    /// Ask the clipboard manager, if there is one, to save the clipboard that this application
+    /// owns, once per contents (freedesktop clipboard manager specification). Returns the
+    /// hand-over, whose reply is to be waited for while serving the manager's requests.
+    pub(crate) fn start_clipboard_hand_off(&mut self) -> Option<ClipboardHandOff> {
+        let clipboard = ClipboardSelectionType::Clipboard;
+        let contents =
+            self.get_clipboard(clipboard).contents_to_hand_off(self.clipboard_handed_off)?;
+
+        let atoms = self.xconn.atoms();
+        // Another client may have taken the clipboard without our having seen it yet.
+        let clipboard_owner = self.xconn.selection_owner(atoms[CLIPBOARD]).ok().flatten();
+        let manager = self.xconn.selection_owner(atoms[CLIPBOARD_MANAGER]).ok().flatten();
+        if !hand_off_proceeds(clipboard_owner, self.selection_window, manager) {
+            return None;
+        }
+        // Once per contents that a manager is there for, whatever comes of it.
+        self.clipboard_handed_off = Some(contents);
+
+        // The targets to save are listed in a property of the requestor.
+        let ReplyPlan::Targets(advertised) = self.get_clipboard(clipboard).plan_conversion(
+            atoms,
+            clipboard,
+            atoms[TARGETS],
+            self.incr_threshold,
+        ) else {
+            return None;
+        };
+        let not_data = [atoms[TARGETS], atoms[TIMESTAMP], atoms[MULTIPLE], atoms[SAVE_TARGETS]];
+        let targets = save_targets_list(&advertised, &not_data);
+        match self.xconn.change_property(
+            self.selection_window,
+            atoms[WINIT_SAVE_TARGETS],
+            xproto::AtomEnum::ATOM.into(),
+            xproto::PropMode::REPLACE,
+            &targets,
+        ) {
+            Ok(cookie) => cookie.ignore_error(),
+            Err(err) => {
+                warn!("Unable to list the clipboard targets to save: {err}");
+                return None;
+            },
+        }
+
+        // A manager whose window is destroyed or whose client exits will never answer.
+        let conn = self.xconn.xcb_connection();
+        if let Ok(cookie) = conn.xfixes_select_selection_input(
+            self.xconn.default_root().root,
+            atoms[CLIPBOARD_MANAGER],
+            xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+        ) {
+            cookie.ignore_error();
+        }
+
+        if let Err(err) = self.xconn.convert_selection(
+            self.selection_window,
+            atoms[CLIPBOARD_MANAGER],
+            atoms[SAVE_TARGETS],
+            atoms[WINIT_SAVE_TARGETS],
+        ) {
+            warn!("Unable to ask the clipboard manager to save the clipboard: {err}");
+            return None;
+        }
+
+        Some(ClipboardHandOff {
+            requestor: self.selection_window,
+            manager: atoms[CLIPBOARD_MANAGER],
+            save_targets: atoms[SAVE_TARGETS],
+            deadline: Instant::now() + CLIPBOARD_MANAGER_TIMEOUT,
+        })
+    }
+
     pub fn request_clipboard_read(&mut self, clipboard: ClipboardSelectionType) -> DataTransferId {
         let clipboard_state = self.get_clipboard(clipboard);
         // TODO: skip the X11 protocol when we own the clipboard.
@@ -1842,14 +2094,9 @@ impl DataTransferState {
         send_data: Box<dyn DataTransferSend>,
         clipboard: ClipboardSelectionType,
     ) {
-        let state = self.get_clipboard_mut(clipboard);
-        // The contents change: the transfer id of the previous ones no longer names them.
-        state.transfer_serial = generate_transfer_id();
-        state.owned_data = Some(send_data);
-        self.xconn.set_selection_owner(
-            self.selection_window,
-            clipboard.selection_atom(self.xconn.atoms()),
-        );
+        let selection = clipboard.selection_atom(self.xconn.atoms());
+        let sequence = self.xconn.set_selection_owner(self.selection_window, selection);
+        self.get_clipboard_mut(clipboard).publish(send_data, sequence);
     }
 
     pub(crate) fn fetch_dnd_data_transfer(

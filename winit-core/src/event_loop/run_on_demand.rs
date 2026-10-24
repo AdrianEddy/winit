@@ -50,6 +50,13 @@ pub trait EventLoopExtRunOnDemand {
     ///   are delivered via callbacks based on an event loop that is internal to the browser itself.
     /// - **iOS:** It's not possible to stop and start an `UIApplication` repeatedly on iOS.
     ///
+    /// ## Platform-specific
+    ///
+    /// - **X11:** When the application owns the clipboard as the loop exits, the clipboard is
+    ///   handed over to the clipboard manager, if one is running, so that it outlives the
+    ///   application: this call waits for the manager to save it, for up to 5 seconds before
+    ///   returning.
+    ///
     /// [`exit()`]: ActiveEventLoop::exit()
     /// [`set_control_flow()`]: ActiveEventLoop::set_control_flow()
     /// [`EventLoopProvider::run_app`]: crate::event_loop::EventLoopProvider::run_app

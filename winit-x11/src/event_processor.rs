@@ -36,8 +36,8 @@ use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
 use crate::data_transfer::{
-    ClipboardSelectionType, DndState, FinishedDataTransfer, OwnerChange, SelectionType,
-    deliver_then_settle, selection_notify_reply,
+    ClipboardHandOff, ClipboardSelectionType, DndState, FinishedDataTransfer, HandOffOutcome,
+    OwnerChange, SelectionType, deliver_then_settle, selection_notify_reply,
 };
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
@@ -312,26 +312,38 @@ impl EventProcessor {
         &mut self,
         event_ptr: &'a mut MaybeUninit<XEvent>,
     ) -> Option<&'a mut XEvent> {
+        self.poll_one_event_matching(event_ptr, |_| true)
+    }
+
+    /// Like [`Self::poll_one_event`], for the first queued event that `filter` accepts: the other
+    /// events stay queued. `filter` runs with the display locked, so it must not call Xlib.
+    pub fn poll_one_event_matching<'a, F: Fn(&XEvent) -> bool>(
+        &mut self,
+        event_ptr: &'a mut MaybeUninit<XEvent>,
+        filter: F,
+    ) -> Option<&'a mut XEvent> {
         // This function is used to poll and remove a single event
         // from the Xlib event queue in a non-blocking, atomic way.
         // XCheckIfEvent is non-blocking and removes events from queue.
         // XNextEvent can't be used because it blocks while holding the
         // global Xlib mutex.
         // XPeekEvent does not remove events from the queue.
-        unsafe extern "C" fn predicate(
+        unsafe extern "C" fn predicate<F: Fn(&XEvent) -> bool>(
             _display: *mut XDisplay,
-            _event: *mut XEvent,
-            _filter: *mut c_char,
+            event: *mut XEvent,
+            filter: *mut c_char,
         ) -> c_int {
-            1
+            // SAFETY: Xlib hands back the filter passed to `XCheckIfEvent`, with a queued event.
+            let (filter, event) = unsafe { (&*filter.cast::<F>(), &*event) };
+            c_int::from(filter(event))
         }
 
         let event_initialized = unsafe {
             (self.target.xconn.xlib.XCheckIfEvent)(
                 self.target.xconn.display,
                 event_ptr.as_mut_ptr(),
-                Some(predicate),
-                std::ptr::null_mut(),
+                Some(predicate::<F>),
+                (&filter as *const F).cast_mut().cast(),
             ) != 0
         };
 
@@ -696,8 +708,46 @@ impl EventProcessor {
         let Some(clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _) else {
             return;
         };
-        let abandoned = self.target.data_transfer_state.get_mut().selection_cleared(clipboard);
+        let data_transfer = self.target.data_transfer_state.get_mut();
+        let abandoned = data_transfer.selection_cleared(clipboard, xev.serial as u64);
         self.deliver_data_transfers(abandoned, app);
+    }
+
+    /// Handle an event that the hand-over of the clipboard to the clipboard manager took
+    /// ([`ClipboardHandOff::takes`]), with no application to deliver to: the manager's requests
+    /// for the clipboard are served, and its reply or departure ends the hand-over.
+    pub(crate) fn clipboard_hand_off_event(
+        &mut self,
+        xev: &mut XEvent,
+        hand_off: &ClipboardHandOff,
+    ) -> Option<HandOffOutcome> {
+        match xev.get_type() {
+            xlib::SelectionRequest => self.selection_request(xev.as_ref()),
+            xlib::PropertyNotify => {
+                self.target.data_transfer_state.get_mut().check_incr_send_data(xev.as_ref())
+            },
+            xlib::SelectionNotify => {
+                let xev: &XSelectionEvent = xev.as_ref();
+                return hand_off.reply(
+                    xev.requestor as _,
+                    xev.selection as _,
+                    xev.target as _,
+                    xev.property as _,
+                );
+            },
+            event_type if event_type == self.xfixesext.first_event as c_int => {
+                let xev: &XFixesSelectionNotifyEvent =
+                    unsafe { &*(xev as *const _ as *const XFixesSelectionNotifyEvent) };
+                // Of `CLIPBOARD_MANAGER`, the only selection whose events the hand-over takes.
+                let selection_window = self.target.data_transfer_state.get_mut().selection_window();
+                let change = OwnerChange::classify(xev.subtype, xev.owner as _, selection_window);
+                if change == OwnerChange::Gone {
+                    return Some(HandOffOutcome::ManagerGone);
+                }
+            },
+            _ => {},
+        }
+        None
     }
 
     /// Deliver finished fetches, once the data transfer state is no longer borrowed: the
