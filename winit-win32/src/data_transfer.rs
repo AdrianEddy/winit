@@ -1142,20 +1142,30 @@ fn alloc_hglobal_from(src: &[u8]) -> Option<HGLOBAL> {
 /// offset placeholder is exactly 10 zero-padded decimal digits, which fixes the header at a
 /// known constant length and removes the chicken-and-egg between header length and offsets.
 ///
-/// If the input already contains `<!--StartFragment-->` we trust the caller's wrapping;
-/// otherwise we wrap it in a minimal `<html><body>` document with fragment markers.
+/// If the input already brackets a fragment, with `<!--StartFragment-->` followed by
+/// `<!--EndFragment-->`, we trust the caller's wrapping; otherwise we wrap it in a minimal
+/// `<html><body>` document with fragment markers.
 ///
 /// [HTML Clipboard Format]: https://learn.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format
 fn build_html_clipboard_format(html: &str) -> Vec<u8> {
-    use std::borrow::Cow;
-
     const START_MARKER: &str = "<!--StartFragment-->";
     const END_MARKER: &str = "<!--EndFragment-->";
+    const DOCUMENT_START: &str = "<html><body>\r\n";
 
-    let body: Cow<'_, str> = if html.contains(START_MARKER) {
-        Cow::Borrowed(html)
-    } else {
-        Cow::Owned(format!("<html><body>\r\n{START_MARKER}{html}{END_MARKER}\r\n</body></html>"))
+    // The byte range of the fragment inside the input, when the input marks one.
+    let marked_fragment = html.find(START_MARKER).and_then(|start| {
+        let fragment_start = start + START_MARKER.len();
+        let fragment_len = html[fragment_start..].find(END_MARKER)?;
+        Some((fragment_start, fragment_start + fragment_len))
+    });
+    let (body, (fragment_start, fragment_end)): (Cow<'_, str>, _) = match marked_fragment {
+        Some(fragment) => (Cow::Borrowed(html), fragment),
+        None => {
+            let fragment_start = DOCUMENT_START.len() + START_MARKER.len();
+            let body =
+                format!("{DOCUMENT_START}{START_MARKER}{html}{END_MARKER}\r\n</body></html>");
+            (Cow::Owned(body), (fragment_start, fragment_start + html.len()))
+        },
     };
 
     const HEADER_LEN: usize = concat!(
@@ -1169,8 +1179,8 @@ fn build_html_clipboard_format(html: &str) -> Vec<u8> {
 
     let start_html = HEADER_LEN;
     let end_html = HEADER_LEN + body.len();
-    let start_fragment = HEADER_LEN + body.find(START_MARKER).unwrap() + START_MARKER.len();
-    let end_fragment = HEADER_LEN + body.find(END_MARKER).unwrap();
+    let start_fragment = HEADER_LEN + fragment_start;
+    let end_fragment = HEADER_LEN + fragment_end;
 
     let header = format!(
         "Version:0.9\r\nStartHTML:{start_html:010}\r\nEndHTML:{end_html:010}\r\nStartFragment:\
@@ -1895,6 +1905,9 @@ pub(crate) unsafe fn apply_drag_image(
     // do NOT call DeleteObject here.
     Ok(())
 }
+
+#[cfg(test)]
+mod clipboard_tests;
 
 #[cfg(test)]
 mod tests {
