@@ -190,3 +190,13 @@ fn multiple_ignores_a_trailing_unpaired_atom() {
     assert_eq!(converted, [(UTF8_STRING_ATOM, 1)]);
     assert_eq!(failed, Some(vec![UTF8_STRING_ATOM, x11rb::NONE]));
 }
+
+#[test]
+fn incremental_transfers_start_at_the_maximum_request_size() {
+    // The smallest maximum request size the core protocol allows.
+    assert_eq!(incr_threshold(4096), 3996);
+    // A server without BIG-REQUESTS.
+    assert_eq!(incr_threshold(262_140), 262_040);
+    // A server with BIG-REQUESTS: one request still stores at most 256 KiB.
+    assert_eq!(incr_threshold(16 * 1024 * 1024), 256 * 1024);
+}
