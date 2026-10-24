@@ -2,12 +2,12 @@
 
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{fmt, io};
 
 use windows_sys::Win32::Globalization::{
     CP_ACP, CP_OEMCP, GetLocaleInfoW, LOCALE_IDEFAULTANSICODEPAGE, LOCALE_IDEFAULTCODEPAGE,
-    LOCALE_RETURN_NUMBER, MultiByteToWideChar,
+    LOCALE_RETURN_NUMBER, MultiByteToWideChar, WideCharToMultiByte,
 };
 use windows_sys::Win32::Graphics::Gdi::{BI_BITFIELDS, BI_RGB};
 use windows_sys::Win32::System::Com::{DVASPECT_CONTENT, TYMED_HGLOBAL, TYMED_ISTREAM};
@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Ole::{
     CF_DSPTEXT, CF_ENHMETAFILE, CF_HDROP, CF_LOCALE, CF_METAFILEPICT, CF_OEMTEXT, CF_OWNERDISPLAY,
     CF_PALETTE, CF_PENDATA, CF_RIFF, CF_SYLK, CF_TEXT, CF_TIFF, CF_UNICODETEXT, CF_WAVE,
 };
-use winit_core::data_transfer::{TransferType, TypeHint};
+use winit_core::data_transfer::{SendData, TransferType, TypeHint};
 
 use crate::util;
 
@@ -94,13 +94,39 @@ const STANDARD_KNOWN_FORMATS: &[(u16, KnownFormat)] = &[
     (CF_WAVE, KnownFormat::Wave),
 ];
 
+const HTML_FORMAT: &str = "HTML Format";
+const RTF_FORMAT: &str = "Rich Text Format";
+const URL_FORMAT: &str = "UniformResourceLocatorW";
+const PNG_FORMAT: &str = "PNG";
+
 /// The registered formats that winit converts, by name.
 const REGISTERED_FORMATS: &[(&str, KnownFormat)] = &[
-    ("HTML Format", KnownFormat::Html),
-    ("Rich Text Format", KnownFormat::Rtf),
-    ("UniformResourceLocatorW", KnownFormat::Url),
-    ("PNG", KnownFormat::Png),
+    (HTML_FORMAT, KnownFormat::Html),
+    (RTF_FORMAT, KnownFormat::Rtf),
+    (URL_FORMAT, KnownFormat::Url),
+    (PNG_FORMAT, KnownFormat::Png),
 ];
+
+/// The registered formats that winit sends.
+#[derive(Clone, Debug)]
+pub(crate) struct RegisteredFormats {
+    pub(crate) html: Option<ClipboardFormat>,
+    pub(crate) rtf: Option<ClipboardFormat>,
+    pub(crate) png: Option<ClipboardFormat>,
+}
+
+impl RegisteredFormats {
+    /// The formats, registered once: the id of a registered format does not change.
+    pub(crate) fn get() -> &'static Self {
+        static FORMATS: OnceLock<RegisteredFormats> = OnceLock::new();
+        let register = |name| ClipboardFormat::register(name).ok();
+        FORMATS.get_or_init(|| Self {
+            html: register(HTML_FORMAT),
+            rtf: register(RTF_FORMAT),
+            png: register(PNG_FORMAT),
+        })
+    }
+}
 
 impl KnownFormat {
     fn identify(id: u16, name: &str) -> Option<Self> {
@@ -226,6 +252,12 @@ impl ClipboardFormat {
 
     pub(crate) fn known(&self) -> Option<KnownFormat> {
         self.known
+    }
+
+    /// This format without its hint: a type that the format matches, but that the types matching
+    /// the format's hint do not.
+    pub(crate) fn without_hint(&self) -> Self {
+        Self { known: None, ..self.clone() }
     }
 }
 
@@ -412,6 +444,70 @@ pub(crate) fn text_code_page(format: KnownFormat, locale: Option<u32>) -> u32 {
 /// The bytes before the first NUL.
 pub(crate) fn until_nul(bytes: &[u8]) -> &[u8] {
     bytes.iter().position(|&byte| byte == 0).map_or(bytes, |nul| &bytes[..nul])
+}
+
+/// The bytes to send `data` in as `format` when winit does not convert it to the format: bytes as
+/// they are, and a string in the encoding of the format with the terminating NUL of the text
+/// formats, which is the ANSI or OEM code page of `locale` (see [`text_code_page`]) for `CF_TEXT`
+/// and `CF_OEMTEXT`, UTF-16 for the URL format, and UTF-8 without a NUL for any other format. A
+/// list of URIs has no such form.
+pub(crate) fn encode_raw(
+    format: &ClipboardFormat,
+    data: SendData,
+    locale: Option<u32>,
+) -> Option<Vec<u8>> {
+    match data {
+        SendData::Bytes(bytes) => Some(bytes),
+        SendData::String(string) => match format.known {
+            Some(known @ (KnownFormat::AnsiText | KnownFormat::OemText)) => {
+                code_page_bytes(&string, text_code_page(known, locale))
+            },
+            Some(KnownFormat::Url) => {
+                Some(string.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect())
+            },
+            _ => Some(string.into_bytes()),
+        },
+        _ => None,
+    }
+}
+
+/// `text` in the code page `code_page` with a terminating NUL, or `None` if the conversion fails.
+/// A character that the code page lacks becomes its default character.
+pub(crate) fn code_page_bytes(text: &str, code_page: u32) -> Option<Vec<u8>> {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut bytes = Vec::new();
+    if !wide.is_empty() {
+        let len = i32::try_from(wide.len()).ok()?;
+        let (null, null_mut) = (std::ptr::null(), std::ptr::null_mut());
+        let size = unsafe {
+            WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                len,
+                null_mut,
+                0,
+                null,
+                null_mut.cast(),
+            )
+        };
+        bytes.resize(usize::try_from(size).ok().filter(|&size| size > 0)?, 0);
+        let written = unsafe {
+            WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                len,
+                bytes.as_mut_ptr(),
+                size,
+                null,
+                null_mut.cast(),
+            )
+        };
+        bytes.truncate(usize::try_from(written).ok().filter(|&written| written > 0)?);
+    }
+    bytes.push(0);
+    Some(bytes)
 }
 
 /// Decodes text in the code page `code_page` with `MultiByteToWideChar`, or returns `None` if

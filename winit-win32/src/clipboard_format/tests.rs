@@ -470,3 +470,37 @@ fn a_bitmap_with_an_invalid_header_is_not_converted() {
     assert_eq!(dib_to_bmp(&valid.dib(4)[..30]), None);
     assert_eq!(dib_to_bmp(&[]), None);
 }
+
+#[test]
+fn a_format_that_winit_does_not_convert_is_sent_in_its_own_encoding() {
+    let string = |text: &str| SendData::String(text.to_owned());
+    let custom = ClipboardFormat::new(REGISTERED_ID, "application/x-example");
+    assert_eq!(encode_raw(&custom, SendData::Bytes(vec![1, 2]), None), Some(vec![1, 2]));
+    let cafe = encode_raw(&custom, string("caf\u{e9}"), None);
+    assert_eq!(cafe, Some("caf\u{e9}".as_bytes().to_vec()));
+    assert_eq!(encode_raw(&custom, SendData::Uris(vec!["file:///a".to_owned()]), None), None);
+    // Text formats end with a NUL, in the code page of their locale or in UTF-16.
+    let ansi = ClipboardFormat::new(CF_TEXT, "CF_TEXT");
+    assert_eq!(encode_raw(&ansi, string("abc"), None), Some(b"abc\0".to_vec()));
+    assert_eq!(encode_raw(&ansi, string(""), None), Some(b"\0".to_vec()));
+    let ansi_privet = encode_raw(&ansi, string(PRIVET), Some(RUSSIAN));
+    assert_eq!(ansi_privet, Some(b"\xcf\xf0\xe8\xe2\xe5\xf2\0".to_vec()));
+    let oem = ClipboardFormat::new(CF_OEMTEXT, "CF_OEMTEXT");
+    assert_eq!(encode_raw(&oem, string("abc"), None), Some(b"abc\0".to_vec()));
+    let oem_privet = encode_raw(&oem, string(PRIVET), Some(RUSSIAN));
+    assert_eq!(oem_privet, Some(b"\x8f\xe0\xa8\xa2\xa5\xe2\0".to_vec()));
+    let url = ClipboardFormat::new(REGISTERED_ID, "UniformResourceLocatorW");
+    let utf16 = "https://a/\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(encode_raw(&url, string("https://a/"), None), Some(utf16));
+    // Bytes are sent as they are, whatever the format.
+    assert_eq!(encode_raw(&ansi, SendData::Bytes(vec![0xff]), None), Some(vec![0xff]));
+}
+
+#[test]
+fn text_is_encoded_in_the_code_page_given() {
+    assert_eq!(code_page_bytes(PRIVET, 1251), Some(b"\xcf\xf0\xe8\xe2\xe5\xf2\0".to_vec()));
+    assert_eq!(code_page_bytes(PRIVET, 866), Some(b"\x8f\xe0\xa8\xa2\xa5\xe2\0".to_vec()));
+    // A character that the code page lacks becomes its default character.
+    assert_eq!(code_page_bytes("\u{41f}", 1252), Some(b"?\0".to_vec()));
+    assert_eq!(code_page_bytes("", 1251), Some(b"\0".to_vec()));
+}

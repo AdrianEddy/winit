@@ -10,6 +10,7 @@ mod delay_render;
 mod drop_target;
 mod reading;
 mod remote_source;
+mod sending;
 mod test_source;
 
 const DRAG: DataTransferId = DataTransferId::from_raw(1);

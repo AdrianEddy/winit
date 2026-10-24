@@ -20,15 +20,14 @@ use windows_sys::Win32::Foundation::{
     GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, OLE_E_WRONGCOMPOBJ, POINT, POINTL,
     RPC_E_CHANGED_MODE, S_FALSE, S_OK,
 };
+use windows_sys::Win32::Globalization::GetSystemDefaultLCID;
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Com::{
     CoTaskMemFree, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STREAM_SEEK_CUR,
     STREAM_SEEK_SET, TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL, TYMED_ISTREAM,
     TYMED_MFPICT, TYMED_NULL,
 };
-use windows_sys::Win32::System::DataExchange::{
-    GetClipboardSequenceNumber, RegisterClipboardFormatW,
-};
+use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
@@ -51,8 +50,8 @@ use winit_core::event_loop::DndAction;
 use winit_core::window::WindowId;
 
 use crate::clipboard_format::{
-    AvailableFormat, BYTE_MEDIA, ClipboardFormat, FormatListing, KnownFormat, Payload, candidates,
-    decode, known_formats, readable_formats,
+    AvailableFormat, BYTE_MEDIA, ClipboardFormat, FormatListing, KnownFormat, Payload,
+    RegisteredFormats, candidates, decode, encode_raw, known_formats, readable_formats,
 };
 use crate::definitions::{
     IDataObject, IDataObjectVtbl, IDropSource, IDropSourceVtbl, IDropTarget, IDropTargetHelper,
@@ -1391,39 +1390,109 @@ fn guids_eq(a: &GUID, b: &GUID) -> bool {
     a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
 }
 
-fn register_clipboard_format(name: &str) -> Option<u16> {
-    let wide = util::encode_wide(name);
-    let atom = unsafe { RegisterClipboardFormatW(wide.as_ptr()) };
-    (atom != 0).then_some(atom as u16)
-}
-
 // Returns the (cf_format, specialised hint) pairs we can lower `hint` to.
 //
 // Most hints map 1:1. Wildcard hints like `Image { extension_hint: None }` -
 // the cross-platform way to say "any image format" - fan out to one entry per
 // concrete format we support, each paired with the specialised hint so
 // `data_for_type` is invoked with a concrete extension instead of `None`.
-fn cf_formats_for_hint(hint: TypeHint) -> Vec<(u16, TypeHint)> {
-    fn one(cf: Option<u16>, hint: TypeHint) -> Vec<(u16, TypeHint)> {
-        cf.map(|cf| vec![(cf, hint)]).unwrap_or_default()
+fn cf_formats_for_hint(
+    hint: TypeHint,
+    registered: &RegisteredFormats,
+) -> Vec<(ClipboardFormat, TypeHint)> {
+    fn one(format: &Option<ClipboardFormat>, hint: TypeHint) -> Vec<(ClipboardFormat, TypeHint)> {
+        format.iter().map(|format| (format.clone(), hint)).collect()
     }
     match hint {
-        TypeHint::Plaintext => vec![(CF_UNICODETEXT, hint)],
-        TypeHint::UriList => vec![(CF_HDROP, hint)],
-        TypeHint::Html => one(register_clipboard_format("HTML Format"), hint),
-        TypeHint::Image { extension_hint: Some("png") } => {
-            one(register_clipboard_format("PNG"), hint)
-        },
+        TypeHint::Plaintext => vec![(ClipboardFormat::new(CF_UNICODETEXT, "CF_UNICODETEXT"), hint)],
+        TypeHint::UriList => vec![(ClipboardFormat::new(CF_HDROP, "CF_HDROP"), hint)],
+        TypeHint::Html => one(&registered.html, hint),
+        TypeHint::Rtf => one(&registered.rtf, hint),
+        TypeHint::Image { extension_hint: Some("png") } => one(&registered.png, hint),
         TypeHint::Image { extension_hint: None } => {
             // Fan out to every concrete image format we can produce.
-            let mut out = Vec::new();
-            if let Some(cf) = register_clipboard_format("PNG") {
-                out.push((cf, TypeHint::Image { extension_hint: Some("png") }));
-            }
-            out
+            one(&registered.png, TypeHint::Image { extension_hint: Some("png") })
         },
         _ => Vec::new(),
     }
+}
+
+/// How a format that the source data object advertises is rendered.
+#[derive(Debug, PartialEq)]
+enum Advertised {
+    /// Converted from the data of the cross-platform type `hint`, which the application supplies
+    /// for that type or for the format itself.
+    Converted { format: ClipboardFormat, hint: TypeHint },
+    /// Sent as the data that the application supplies for the format itself.
+    Raw(ClipboardFormat),
+    /// `CF_LOCALE`, with this locale identifier, for raw `CF_TEXT` and `CF_OEMTEXT` when the
+    /// application offers no `CF_LOCALE`: the locale of this system, in whose code pages their
+    /// strings are encoded.
+    Locale(u32),
+}
+
+impl Advertised {
+    /// The type to ask the application's data for, which only the types that supply the format
+    /// match: [`DataTransferSend::data_for_type`] serves the first offered type that matches it.
+    ///
+    /// The data of a converted format is asked for as the format, which a type hint matches
+    /// through the format's hint and a [`ClipboardFormat`] by its id, so that another format of
+    /// the same hint does not supply it. The data of a raw format is asked for as the format
+    /// without its hint, so that a type hint does not supply it either. A locale that winit
+    /// supplies is not asked for.
+    fn request(&self) -> Option<ClipboardFormat> {
+        match self {
+            Self::Converted { format, .. } => Some(format.clone()),
+            Self::Raw(format) => Some(format.without_hint()),
+            Self::Locale(_) => None,
+        }
+    }
+}
+
+/// The formats to advertise for the types that `send_data` offers, each once.
+///
+/// A type hint is advertised as the formats it converts to. A [`ClipboardFormat`] is advertised
+/// as converted from its hint when that converts to the format itself, and as raw otherwise.
+fn advertised_formats(
+    send_data: &dyn DataTransfer,
+    registered: &RegisteredFormats,
+) -> Vec<(u16, Advertised)> {
+    let mut formats: Vec<(u16, Advertised)> = Vec::new();
+    let mut advertise = |id: u16, advertised: Advertised| {
+        if !formats.iter().any(|(advertised_id, _)| *advertised_id == id) {
+            formats.push((id, advertised));
+        }
+    };
+    send_data.for_each_available_type(&mut |ty| {
+        if let Some(format) = ty.cast_ref::<ClipboardFormat>() {
+            let converted = format.hint().and_then(|hint| {
+                cf_formats_for_hint(hint, registered)
+                    .into_iter()
+                    .find(|(converted, _)| converted == format)
+            });
+            match converted {
+                Some((format, hint)) => {
+                    advertise(format.id(), Advertised::Converted { format, hint })
+                },
+                None => advertise(format.id(), Advertised::Raw(format.clone())),
+            }
+        } else if let Some(hint) = ty.hint() {
+            for (format, hint) in cf_formats_for_hint(hint, registered) {
+                advertise(format.id(), Advertised::Converted { format, hint });
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    // A reader decodes code page text in the code page of its `CF_LOCALE`, which, unless the data
+    // object gives one, the system takes from the current input language.
+    let code_page_text = formats.iter().any(|(_, advertised)| {
+        matches!(advertised, Advertised::Raw(format)
+            if matches!(format.known(), Some(KnownFormat::AnsiText | KnownFormat::OemText)))
+    });
+    if code_page_text && !formats.iter().any(|(id, _)| *id == CF_LOCALE) {
+        formats.push((CF_LOCALE, Advertised::Locale(unsafe { GetSystemDefaultLCID() })));
+    }
+    formats
 }
 
 /// Duplicate a `STGMEDIUM` for handing out via `GetData` without losing the original.
@@ -1484,6 +1553,10 @@ fn alloc_hglobal_from(src: &[u8]) -> Option<HGLOBAL> {
     let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, src.len()) };
     if hglobal.is_null() {
         return None;
+    }
+    // An empty global memory object has no memory to lock.
+    if src.is_empty() {
+        return Some(hglobal);
     }
     let dst = unsafe { GlobalLock(hglobal) };
     if dst.is_null() {
@@ -1567,6 +1640,12 @@ unsafe fn send_data_to_stgmedium(data: SendData, hint: TypeHint) -> Option<STGME
             let bytes = build_html_clipboard_format(&s);
             alloc_hglobal_from(&bytes)?
         },
+        SendData::String(s) if matches!(hint, TypeHint::Rtf) => {
+            // RTF is 8-bit text, terminated by a NUL like the other text formats.
+            let mut bytes = s.into_bytes();
+            bytes.push(0);
+            alloc_hglobal_from(&bytes)?
+        },
         SendData::String(s) => {
             // UTF-16 + NUL - used for `CF_UNICODETEXT` and other text-ish registered formats.
             let utf16 = util::encode_wide(&s);
@@ -1621,11 +1700,15 @@ unsafe fn send_data_to_stgmedium(data: SendData, hint: TypeHint) -> Option<STGME
         SendData::Bytes(b) => alloc_hglobal_from(&b)?,
         _ => return None,
     };
+    Some(hglobal_medium(hglobal))
+}
 
+/// A storage medium that hands over `hglobal`.
+fn hglobal_medium(hglobal: HGLOBAL) -> STGMEDIUM {
     let mut medium = unsafe { std::mem::zeroed::<STGMEDIUM>() };
     medium.tymed = TYMED_HGLOBAL as u32;
     medium.u.hGlobal = hglobal;
-    Some(medium)
+    medium
 }
 
 /// True if the `SendData` variant carries the on-the-wire shape OLE expects for `hint`'s mapped
@@ -1810,8 +1893,8 @@ struct SourceDataObjectData {
     interface: IDataObjectInterface,
     refcount: AtomicUsize,
     send_data: RefCell<Box<dyn DataTransferSend>>,
-    // (cf_format, hint) pairs we advertise to the target.
-    formats: Vec<(u16, TypeHint)>,
+    // The formats we advertise to the target.
+    formats: Vec<(u16, Advertised)>,
     // Formats injected via `SetData` - primarily by `IDragSourceHelper::InitializeFromBitmap`,
     // which stores the drag image bits (CFSTR_DRAGIMAGEBITS) and related shell formats here so
     // the target-side `IDropTargetHelper` can read them back via `GetData`.
@@ -1823,17 +1906,7 @@ com_iunknown_impl!(SourceDataObjectData, &IID_IDataObject);
 #[allow(non_snake_case)]
 impl SourceDataObjectData {
     fn new_boxed(send_data: Box<dyn DataTransferSend>) -> *mut Self {
-        let mut formats: Vec<(u16, TypeHint)> = Vec::new();
-        send_data.for_each_available_type(&mut |ty| {
-            if let Some(hint) = ty.hint() {
-                for (cf, specialised) in cf_formats_for_hint(hint) {
-                    if !formats.iter().any(|(c, _)| *c == cf) {
-                        formats.push((cf, specialised));
-                    }
-                }
-            }
-            ControlFlow::Continue(())
-        });
+        let formats = advertised_formats(&*send_data, RegisteredFormats::get());
 
         Box::into_raw(Box::new(Self {
             interface: IDataObjectInterface {
@@ -1844,6 +1917,21 @@ impl SourceDataObjectData {
             formats,
             extras: RefCell::new(Vec::new()),
         }))
+    }
+
+    /// The locale identifier of the `CF_LOCALE` that this object gives: the application's, or
+    /// the one that winit supplies, if either is advertised.
+    fn served_locale(&self, send_data: &dyn DataTransferSend) -> Option<u32> {
+        let (_, locale) = self.formats.iter().find(|(id, _)| *id == CF_LOCALE)?;
+        match locale {
+            Advertised::Locale(locale) => Some(*locale),
+            _ => match send_data.data_for_type(&locale.request()?)? {
+                SendData::Bytes(bytes) => {
+                    Some(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))
+                },
+                _ => None,
+            },
+        }
     }
 
     unsafe extern "system" fn GetData(
@@ -1871,25 +1959,50 @@ impl SourceDataObjectData {
                 }
             }
         }
-        let Some(&(_, hint)) = me.formats.iter().find(|&&(cf, _)| cf == format.cfFormat) else {
+        let Some((_, advertised)) = me.formats.iter().find(|(cf, _)| *cf == format.cfFormat) else {
             return DV_E_FORMATETC;
         };
         // `try_borrow_mut` rather than `borrow_mut`: `data_for_type` is the app's callback and
         // may itself reach back into this `IDataObject`. A panic across the `extern "system"`
         // boundary would be UB; return `E_UNEXPECTED` instead.
-        let data = {
-            let Ok(send_data) = me.send_data.try_borrow_mut() else {
-                return E_UNEXPECTED;
-            };
-            send_data.data_for_type(&hint)
+        let Ok(send_data) = me.send_data.try_borrow_mut() else {
+            return E_UNEXPECTED;
         };
-        let Some(data) = data else {
-            return DV_E_FORMATETC;
+        let data = match advertised.request() {
+            Some(request) => match send_data.data_for_type(&request) {
+                Some(data) => Some(data),
+                None => return DV_E_FORMATETC,
+            },
+            None => None,
         };
-        if !variant_matches_hint(hint, &data) {
-            return DV_E_FORMATETC;
-        }
-        let Some(medium) = (unsafe { send_data_to_stgmedium(data, hint) }) else {
+        let medium = match (advertised, data) {
+            (Advertised::Converted { hint, .. }, Some(data)) => {
+                if !variant_matches_hint(*hint, &data) {
+                    return DV_E_FORMATETC;
+                }
+                unsafe { send_data_to_stgmedium(data, *hint) }
+            },
+            (Advertised::Raw(format), Some(data)) => {
+                // A string of code page text is encoded in the code page of the locale that this
+                // object gives as its `CF_LOCALE`.
+                let locale = match (&data, format.known()) {
+                    (SendData::String(_), Some(KnownFormat::AnsiText | KnownFormat::OemText)) => {
+                        me.served_locale(&**send_data)
+                    },
+                    _ => None,
+                };
+                let Some(bytes) = encode_raw(format, data, locale) else {
+                    return DV_E_FORMATETC;
+                };
+                alloc_hglobal_from(&bytes).map(hglobal_medium)
+            },
+            (Advertised::Locale(locale), _) => {
+                alloc_hglobal_from(&locale.to_le_bytes()).map(hglobal_medium)
+            },
+            (Advertised::Converted { .. } | Advertised::Raw(_), None) => return DV_E_FORMATETC,
+        };
+        drop(send_data);
+        let Some(medium) = medium else {
             return E_FAIL;
         };
         unsafe { *pmedium = medium };
