@@ -1,0 +1,133 @@
+//! Unit tests for the selection and drag-and-drop logic that runs without an X server.
+
+use std::ptr;
+
+use winit_core::data_transfer::{DataTransferSend, DataTransferSendBuilder, TypeHint};
+use x11_dl::xlib::XSelectionRequestEvent;
+use x11rb::protocol::xproto;
+
+use super::*;
+
+const TARGETS_ATOM: xproto::Atom = 101;
+const TIMESTAMP_ATOM: xproto::Atom = 102;
+const UTF8_STRING_ATOM: xproto::Atom = 103;
+const STRING_ATOM: xproto::Atom = 104;
+const TEXT_PLAIN_ATOM: xproto::Atom = 105;
+const TEXT_PLAIN_UTF8_ATOM: xproto::Atom = 106;
+const IMAGE_PNG_ATOM: xproto::Atom = 107;
+
+/// The atoms the tests use, each with its own value; every other atom is 0, which no test uses.
+fn atoms() -> Atoms {
+    Atoms {
+        TARGETS: TARGETS_ATOM,
+        TIMESTAMP: TIMESTAMP_ATOM,
+        UTF8_STRING: UTF8_STRING_ATOM,
+        STRING: STRING_ATOM,
+        TextPlain: TEXT_PLAIN_ATOM,
+        TextPlainCharsetUtf8: TEXT_PLAIN_UTF8_ATOM,
+        ImagePng: IMAGE_PNG_ATOM,
+        ..Default::default()
+    }
+}
+
+/// A clipboard owned by this application, offering `text` as plain text.
+fn owned_text(text: &'static str) -> ClipboardState {
+    let send: Box<dyn DataTransferSend> = DataTransferSendBuilder::new(())
+        .with_type(TypeHint::Plaintext, move |_, _| Some(text.to_owned()))
+        .build();
+    ClipboardState { owned_data: Some(send), ..Default::default() }
+}
+
+fn request(target: xproto::Atom, property: xproto::Atom) -> XSelectionRequestEvent {
+    XSelectionRequestEvent {
+        type_: 30,
+        serial: 7,
+        send_event: 0,
+        display: ptr::null_mut(),
+        owner: 11,
+        requestor: 12,
+        selection: 13,
+        target: target as _,
+        property: property as _,
+        time: 4242,
+    }
+}
+
+#[test]
+fn a_refused_request_is_answered_with_property_none() {
+    let request = request(UTF8_STRING_ATOM, 77);
+    let reply = selection_notify_reply(&request, None);
+
+    assert_eq!(reply.property, x11rb::NONE);
+    assert_eq!(reply.requestor, 12);
+    assert_eq!(reply.selection, 13);
+    assert_eq!(reply.target, UTF8_STRING_ATOM);
+    assert_eq!(reply.time, 4242);
+}
+
+#[test]
+fn an_answered_request_names_the_property_of_the_reply() {
+    let request = request(UTF8_STRING_ATOM, 77);
+    let reply = selection_notify_reply(&request, Some(77));
+
+    assert_eq!(reply.property, 77);
+    assert_eq!(reply.time, 4242);
+}
+
+#[test]
+fn an_obsolete_client_is_answered_on_the_target_property() {
+    assert_eq!(reply_property(x11rb::NONE, UTF8_STRING_ATOM), UTF8_STRING_ATOM);
+    assert_eq!(reply_property(77, UTF8_STRING_ATOM), 77);
+}
+
+#[test]
+fn a_selection_without_owned_data_refuses_every_conversion() {
+    let state = ClipboardState::default();
+    let atoms = atoms();
+
+    assert_eq!(state.plan_conversion(&atoms, TARGETS_ATOM, 1024), ReplyPlan::Refuse);
+    assert_eq!(state.plan_conversion(&atoms, UTF8_STRING_ATOM, 1024), ReplyPlan::Refuse);
+}
+
+#[test]
+fn a_conversion_to_a_type_that_is_not_offered_is_refused() {
+    let state = owned_text("hello");
+
+    assert_eq!(state.plan_conversion(&atoms(), IMAGE_PNG_ATOM, 1024), ReplyPlan::Refuse);
+}
+
+#[test]
+fn targets_lists_timestamp_targets_and_the_offered_types() {
+    let state = owned_text("hello");
+
+    let ReplyPlan::Targets(targets) = state.plan_conversion(&atoms(), TARGETS_ATOM, 1024) else {
+        panic!("TARGETS should be answered with a list of targets");
+    };
+    assert_eq!(&targets[..2], &[TIMESTAMP_ATOM, TARGETS_ATOM]);
+    for text in [STRING_ATOM, UTF8_STRING_ATOM, TEXT_PLAIN_ATOM, TEXT_PLAIN_UTF8_ATOM] {
+        assert!(targets.contains(&text), "plain text target {text} is advertised");
+    }
+    assert!(!targets.contains(&IMAGE_PNG_ATOM));
+}
+
+#[test]
+fn timestamp_is_answered() {
+    let state = owned_text("hello");
+
+    assert_eq!(state.plan_conversion(&atoms(), TIMESTAMP_ATOM, 1024), ReplyPlan::Timestamp);
+}
+
+#[test]
+fn small_data_is_stored_directly_and_large_data_incrementally() {
+    let state = owned_text("hello");
+    let utf8 = SelectionType { hint: Some(TypeHint::Plaintext), atom: UTF8_STRING_ATOM };
+
+    assert_eq!(
+        state.plan_conversion(&atoms(), UTF8_STRING_ATOM, 6),
+        ReplyPlan::Direct(utf8.clone(), b"hello".to_vec())
+    );
+    assert_eq!(
+        state.plan_conversion(&atoms(), UTF8_STRING_ATOM, 5),
+        ReplyPlan::Incr(utf8, b"hello".to_vec())
+    );
+}

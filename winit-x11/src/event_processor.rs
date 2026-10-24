@@ -27,7 +27,6 @@ use x11_dl::xlib::{
     XReparentEvent, XSelectionEvent, XSelectionRequestEvent, XVisibilityEvent, XkbAnyEvent,
     XkbStateRec,
 };
-use x11rb::CURRENT_TIME;
 use x11rb::protocol::sync::{ConnectionExt, Int64};
 use x11rb::protocol::xinput;
 use x11rb::protocol::xkb::ID as XkbId;
@@ -36,7 +35,9 @@ use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
-use crate::data_transfer::{ClipboardSelectionType, DndState, SelectionType};
+use crate::data_transfer::{
+    ClipboardSelectionType, DndState, SelectionType, selection_notify_reply,
+};
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
     ScrollOrientation, mkdid, mkwid,
@@ -605,26 +606,16 @@ impl EventProcessor {
     /// Handles the X11 `SelectionRequest` which occurs when we own a selection and another
     /// application wants to read it
     fn selection_request(&mut self, xev: &XSelectionRequestEvent) {
-        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
-        if !data_transfer.attach_clipboard_property(xev) {
-            info!("Not sending selection notify, no resolved value");
-            return;
-        }
-        // Notify the other program that we've put the property on the clipboard
-        let notify = xproto::SelectionNotifyEvent {
-            response_type: xproto::SELECTION_NOTIFY_EVENT,
-            sequence: 0,
-            time: CURRENT_TIME,
-            requestor: xev.requestor as _,
-            selection: xev.selection as _,
-            target: xev.target as _,
-            property: xev.property as _,
-        };
+        let property = self.target.data_transfer_state.get_mut().answer_selection_request(xev);
+        // Every request is answered, a refusal with the property `None`.
+        let notify = selection_notify_reply(xev, property);
         let con = self.target.x_connection();
+        // ICCCM: the reply is sent with an empty event mask, which delivers it to the client that
+        // created the requestor window.
         let result = con.xcb_connection().send_event(
             false,
             notify.requestor,
-            xproto::EventMask::PROPERTY_CHANGE,
+            xproto::EventMask::NO_EVENT,
             notify,
         );
         if let Err(err) = result {
