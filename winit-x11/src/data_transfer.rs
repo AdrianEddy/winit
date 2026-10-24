@@ -627,9 +627,13 @@ impl DataTransferState {
                 .change_property(requestor, prop, xproto::AtomEnum::ATOM.into(), replace, &accepted)
                 .expect_then_ignore_error("unable to change property to set TARGETS");
 
-            let advertised =
-                accepted.iter().map(|&atom| self.xconn.atom_str(atom)).collect::<Vec<_>>();
-            trace!("Written TARGETS {advertised:?} into property {} ", self.xconn.atom_str(prop));
+            // The names are resolved inside `trace!`, so that the round trip per atom is only made
+            // when trace logging is enabled.
+            trace!(
+                "Written TARGETS {:?} into property {} ",
+                accepted.iter().map(|&atom| self.xconn.atom_str(atom)).collect::<Vec<_>>(),
+                self.xconn.atom_str(prop)
+            );
 
             true
         } else if target == atoms[TIMESTAMP] as _ {
@@ -884,8 +888,10 @@ impl DataTransferState {
             return;
         };
 
-        let available = targets.iter().map(|t| self.xconn.atom_str(t.atom())).collect::<Vec<_>>();
-        trace!("Received available targets {available:?} for clipboard {clipboard:?}");
+        trace!(
+            "Received available targets {:?} for clipboard {clipboard:?}",
+            targets.iter().map(|t| self.xconn.atom_str(t.atom())).collect::<Vec<_>>()
+        );
 
         self.get_clipboard_mut(clipboard).types = targets.into();
     }
