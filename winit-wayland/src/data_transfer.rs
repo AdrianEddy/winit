@@ -143,6 +143,18 @@ impl MimeType {
         (IMAGE_X_ICON, TypeHint::Image { extension_hint: Some("ico") }),
     ];
 
+    /// Creates a MIME type from its name, such as `application/x-example`.
+    ///
+    /// The hint is detected from the name, the same way as for a type offered by another client.
+    pub fn new(mime: impl Into<String>) -> Self {
+        Self::parse(mime.into())
+    }
+
+    /// The name of this MIME type.
+    pub fn as_str(&self) -> &str {
+        &self.mime
+    }
+
     // Returns an iterator so that things like the multiple charsets for plaintext/HTML
     // and the multiple ways of expressing .wav work correctly.
     fn from_dyn(type_: &dyn TransferType) -> impl Iterator<Item = Self> {
@@ -1372,3 +1384,6 @@ impl PrimarySelectionSourceHandler for WinitState {
             .take_if(|primary| primary.data_source.inner() == source);
     }
 }
+
+#[cfg(test)]
+mod tests;
