@@ -118,20 +118,24 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 });
             },
             TextInputEvent::Done { .. } => {
-                let window_id = match text_input_data.surface.as_ref() {
-                    Some(surface) => crate::make_wid(surface),
-                    None => return,
-                };
+                // The window this `done` delivers to, if any: none without a surface, and none for
+                // a window whose IME is disabled, in case some IME sends events for it.
+                let target =
+                    text_input_data.surface.as_ref().map(crate::make_wid).filter(|window_id| {
+                        windows.get(window_id).is_none_or(|window| {
+                            window.lock().unwrap().text_input_state().is_some()
+                        })
+                    });
 
-                // Just in case some IME sends an event for the disabled window.
-                if let Some(window) = windows.get(&window_id) {
-                    if window.lock().unwrap().text_input_state().is_none() {
-                        return;
-                    }
-                };
-
-                for event in text_input_data.take_done_events() {
-                    state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
+                // text-input-v3 resets the pending state at every `done`, so a `done` that delivers
+                // to no window discards it rather than leaving it for the next `done`.
+                match target {
+                    Some(window_id) => {
+                        for event in text_input_data.take_done_events() {
+                            state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
+                        }
+                    },
+                    None => text_input_data.discard_pending(),
                 }
             },
             _ => {},
@@ -260,6 +264,15 @@ impl TextInputDataInner {
         });
 
         [delete, commit_or_clear, preedit].into_iter().flatten()
+    }
+
+    /// Resets the pending state of a `done` that delivers to no window. text-input-v3 says each
+    /// item "must be applied and reset to initial on the next zwp_text_input_v3.done event".
+    /// Nothing was delivered, so `last_preedit_empty` keeps what the application was last told.
+    fn discard_pending(&mut self) {
+        self.pending_commit = None;
+        self.pending_preedit = None;
+        self.pending_delete = None;
     }
 }
 
