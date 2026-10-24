@@ -16,6 +16,7 @@ use winit_core::event_loop::AsyncRequestSerial;
 use winit_core::window::WindowId;
 use x11_dl::xlib::{XPropertyEvent, XSelectionEvent, XSelectionRequestEvent};
 use x11rb::CURRENT_TIME;
+use x11rb::connection::RequestConnection as _;
 use x11rb::errors::ReplyError;
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt};
@@ -26,8 +27,25 @@ use crate::event_loop::{CookieResultExt, X11Error};
 use crate::xdisplay::XConnection;
 use crate::{XWindow, util};
 
-/// The maximum number of bytes when we are sending data
-const INCR_CHUNK_SIZE_BYTES: usize = 1024;
+/// The most data stored in a property with one request, whatever the server accepts.
+const MAX_PROPERTY_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The largest selection reply stored in one request, which is also the chunk size of an
+/// incremental (INCR) transfer: the server's maximum request size, less room for the request's
+/// header, capped at [`MAX_PROPERTY_CHUNK_BYTES`].
+///
+/// ICCCM: INCR is for data too large to store in the property with one request. The core
+/// protocol guarantees a maximum request size of at least 4096 bytes.
+pub(crate) fn incr_threshold(maximum_request_bytes: usize) -> usize {
+    maximum_request_bytes.saturating_sub(100).min(MAX_PROPERTY_CHUNK_BYTES)
+}
+
+/// The value of the `INCR` property that starts an incremental transfer of `len` bytes.
+///
+/// ICCCM: it is a single 32-bit integer, a lower bound on the number of bytes of the selection.
+pub(crate) fn incr_announcement(len: usize) -> [u32; 1] {
+    [u32::try_from(len).unwrap_or(u32::MAX)]
+}
 
 /// TODO: this is copied from wayland. Is this the right approach for X11 as well?
 fn encode_uri_list<I>(uri_list: I) -> Vec<u8>
@@ -427,6 +445,8 @@ pub struct DataTransferState {
     clip_incr_send: Vec<IncrState>,
     /// Contains the partially received message from the clipboard using the INCR ICCCM protocol
     clip_incr_receive: Vec<IncrState>,
+    /// See [`incr_threshold`].
+    incr_threshold: usize,
 }
 
 #[derive(Debug)]
@@ -578,12 +598,15 @@ impl DataTransferState {
             Err(err) => error!("Failed to query the XFixes version: {err}"),
         }
 
+        let incr_threshold = incr_threshold(conn.maximum_request_bytes());
+
         DataTransferState {
             xconn,
             state: Default::default(),
             clipboards: Default::default(),
             clip_incr_send: Default::default(),
             clip_incr_receive: Default::default(),
+            incr_threshold,
         }
     }
 
@@ -797,7 +820,7 @@ impl DataTransferState {
         let atoms = self.xconn.atoms();
         let replace = xproto::PropMode::REPLACE;
         let plan =
-            self.get_clipboard(clipboard).plan_conversion(atoms, target, INCR_CHUNK_SIZE_BYTES);
+            self.get_clipboard(clipboard).plan_conversion(atoms, target, self.incr_threshold);
 
         let stored = match plan {
             ReplyPlan::Refuse => {
@@ -881,10 +904,16 @@ impl DataTransferState {
             requestor,
             &xproto::ChangeWindowAttributesAux { event_mask, ..Default::default() },
         )?;
+        let announcement = incr_announcement(data.len());
         self.clip_incr_send.push(IncrState { data, property, ty, clipboard });
         xconn
-            .change_property::<u32>(requestor, property, atoms[INCR], xproto::PropMode::REPLACE, &[
-            ])
+            .change_property(
+                requestor,
+                property,
+                atoms[INCR],
+                xproto::PropMode::REPLACE,
+                &announcement,
+            )
             .expect_then_ignore_error("unable to change property to start INCR sender");
         trace!("Starting INCR sender to {requestor} property {}", xconn.atom_str(property));
 
@@ -1010,12 +1039,13 @@ impl DataTransferState {
             return;
         }
 
+        let chunk_size = self.incr_threshold;
         self.clip_incr_send.retain_mut(|IncrState { data, property, ty, .. }| {
             if *property != atom {
                 return true;
             }
 
-            let bytes_to_take = INCR_CHUNK_SIZE_BYTES.min(data.len());
+            let bytes_to_take = chunk_size.min(data.len());
             let sending = &data[..bytes_to_take];
             if let Err(err) = self.xconn.change_property(
                 xwindow,
