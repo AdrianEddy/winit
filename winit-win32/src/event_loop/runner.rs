@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Ole::{
     DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, PostMessageW, WM_NULL};
 use winit_core::application::ApplicationHandler;
 use winit_core::data_transfer::DataTransferId;
 use winit_core::event::{DeviceEvent, DeviceId, StartCause, SurfaceSizeWriter, WindowEvent};
@@ -482,6 +482,7 @@ impl EventLoopRunner {
                 self.call_new_events(true);
                 self.call_event_handler(|app, event_loop| app.about_to_wait(event_loop));
                 self.last_events_cleared.set(Instant::now());
+                self.wake_for_buffered_events();
             },
             (Uninitialized, Destroyed) => {
                 self.call_new_events(true);
@@ -500,6 +501,7 @@ impl EventLoopRunner {
                 // This is always the last event we dispatch before waiting for new events
                 self.call_event_handler(|app, event_loop| app.about_to_wait(event_loop));
                 self.last_events_cleared.set(Instant::now());
+                self.wake_for_buffered_events();
             },
             (HandlingMainEvents, Destroyed) => {
                 self.call_event_handler(|app, event_loop| app.about_to_wait(event_loop));
@@ -507,6 +509,18 @@ impl EventLoopRunner {
             },
 
             (Destroyed, _) => panic!("cannot move state from Destroyed"),
+        }
+    }
+
+    /// Makes the coming wait end at once if `about_to_wait` sent events.
+    ///
+    /// Events sent while a handler runs are buffered until it returns, and nothing dispatches
+    /// the buffer after `about_to_wait`, so they would wait for an unrelated message. The wait
+    /// ends when a message is queued, so the no-op `WM_NULL` is posted; the next iteration then
+    /// dispatches the buffer right after `new_events`.
+    fn wake_for_buffered_events(&self) {
+        if !self.event_buffer.borrow().is_empty() {
+            unsafe { PostMessageW(self.thread_msg_target, WM_NULL, 0, 0) };
         }
     }
 
@@ -598,3 +612,6 @@ impl Event {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
