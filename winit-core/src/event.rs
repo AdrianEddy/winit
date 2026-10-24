@@ -149,6 +149,9 @@ pub enum WindowEvent {
     /// cases, winit may dispatch the event to all  windows that have access to the data
     /// transfer. If your application should only process this event once per data transfer, the
     /// `serial` field can be used to deduplicate it.
+    ///
+    /// A fetch that fails after `fetch_data_transfer` returned its serial is answered by this
+    /// event too: the methods of `value` that read the data then return the error.
     DataTransferReceived {
         /// ID of the data transfer object, see
         /// [`crate::event_loop::ActiveEventLoop::data_transfer`].

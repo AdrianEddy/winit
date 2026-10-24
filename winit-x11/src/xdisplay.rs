@@ -330,13 +330,15 @@ impl XConnection {
 
     /// Issues a request to convert a selection (e.g. atoms[XdndSelection], atoms[Clipboard]) to a
     /// particular target type. The result is sent in a [`xproto::SelectionNotifyEvent`].
+    ///
+    /// Returns the sequence number of the `ConvertSelection` request.
     pub fn convert_selection(
         &self,
         xwindow: xproto::Window,
         selection: xproto::Atom,
         target: xproto::Atom,
         property: xproto::Atom,
-    ) -> Result<(), X11Error> {
+    ) -> Result<u64, X11Error> {
         trace!(
             "Requesting {} from selection {} into property {}",
             self.atom_str(target),
@@ -349,11 +351,17 @@ impl XConnection {
             return Err(X11Error::UnexpectedNull("selection owner"));
         }
 
-        self.xcb_connection()
-            .convert_selection(xwindow, selection, target, property, CURRENT_TIME)?
-            .check()?;
+        let cookie = self.xcb_connection().convert_selection(
+            xwindow,
+            selection,
+            target,
+            property,
+            CURRENT_TIME,
+        )?;
+        let sequence = cookie.sequence_number();
+        cookie.check()?;
 
-        Ok(())
+        Ok(sequence)
     }
 
     /// Get the window owning the selection, or `None`.

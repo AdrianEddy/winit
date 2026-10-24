@@ -36,7 +36,8 @@ use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
 use crate::data_transfer::{
-    ClipboardSelectionType, DndState, SelectionType, selection_notify_reply,
+    ClipboardSelectionType, DndState, FinishedDataTransfer, OwnerChange, SelectionType,
+    selection_notify_reply,
 };
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
@@ -189,7 +190,7 @@ impl EventProcessor {
             xlib::ClientMessage => self.client_message(xev.as_ref(), app),
             xlib::SelectionRequest => self.selection_request(xev.as_ref()),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), app),
-            xlib::SelectionClear => self.selection_clear(xev.as_ref()),
+            xlib::SelectionClear => self.selection_clear(xev.as_ref(), app),
             xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), app),
             xlib::ReparentNotify => self.reparent_notify(xev.as_ref()),
             xlib::MapNotify => self.map_notify(xev.as_ref(), app),
@@ -297,7 +298,7 @@ impl EventProcessor {
                 if event_type == self.xfixesext.first_event as _ {
                     let xev: &XFixesSelectionNotifyEvent =
                         unsafe { &*(xev as *const _ as *const XFixesSelectionNotifyEvent) };
-                    self.xfixes_selection_notify(xev);
+                    self.xfixes_selection_notify(xev, app);
                 }
             },
         }
@@ -648,7 +649,11 @@ impl EventProcessor {
         }
     }
 
-    fn xfixes_selection_notify(&mut self, xev: &XFixesSelectionNotifyEvent) {
+    fn xfixes_selection_notify(
+        &mut self,
+        xev: &XFixesSelectionNotifyEvent,
+        app: &mut dyn ApplicationHandler,
+    ) {
         let Some(clipboard) = ClipboardSelectionType::from_atom(
             self.target.x_connection().atoms(),
             xev.selection as _,
@@ -656,29 +661,41 @@ impl EventProcessor {
             return;
         };
 
-        // If the selection is not owned then clear
-        if xev.owner == 0 {
-            self.target.data_transfer_state.borrow_mut().clear_clipboard(clipboard);
-            return;
-        }
-
-        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
+        let data_transfer = self.target.data_transfer_state.get_mut();
+        let change = OwnerChange::classify(
+            xev.subtype,
+            xev.owner as xproto::Window,
+            data_transfer.selection_window(),
+        );
         let serial = {
             // Conversion needed on 32-bit targets.
             #[allow(clippy::useless_conversion)]
             u64::from(xev.selection_timestamp)
         };
-        data_transfer.request_updated_targets(clipboard, serial);
+        let abandoned = data_transfer.selection_owner_changed(clipboard, change, serial);
+        self.deliver_data_transfers(abandoned, app);
     }
 
     /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not
-    fn selection_clear(&mut self, xev: &XSelectionEvent) {
+    fn selection_clear(&mut self, xev: &XSelectionEvent, app: &mut dyn ApplicationHandler) {
         let atoms = self.target.x_connection().atoms();
         let Some(clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _) else {
             return;
         };
-        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
-        data_transfer.clear_clipboard(clipboard);
+        let abandoned = self.target.data_transfer_state.get_mut().selection_cleared(clipboard);
+        self.deliver_data_transfers(abandoned, app);
+    }
+
+    /// Deliver finished fetches, once the data transfer state is no longer borrowed: the
+    /// application may fetch again from its handler.
+    fn deliver_data_transfers(
+        &self,
+        finished: Vec<FinishedDataTransfer>,
+        app: &mut dyn ApplicationHandler,
+    ) {
+        for finished in finished {
+            app.window_event(&self.target, finished.window(), finished.into_event());
+        }
     }
 
     fn selection_notify_dnd(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
@@ -779,54 +796,8 @@ impl EventProcessor {
 
     /// Data received from another application
     fn selection_notify_clip(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
-        let xwindow = xev.requestor as xproto::Window;
-        let property = xev.property as xproto::Atom;
-
-        // Our conversions are received on the selection window: anything else is not ours
-        if xwindow != self.target.data_transfer_state.get_mut().selection_window() {
-            return;
-        }
-
-        // If we get a target that is not one of our known clipboards the skip
-        let Some(clipboard) = ClipboardSelectionType::from_atom(
-            self.target.x_connection().atoms(),
-            xev.selection as _,
-        ) else {
-            return;
-        };
-
-        // If we get a none property then skip
-        if xev.property as xproto::Atom == xproto::AtomEnum::NONE.into() {
-            return;
-        }
-
-        let con = &self.target.xconn;
-        let atoms = con.atoms();
-
-        let data_transfer = self.target.data_transfer_state.get_mut();
-        let mut property_value = Vec::new();
-        let property_ty = match con.get_dynamic_property(property, xwindow, &mut property_value) {
-            Ok((property_ty, _)) => property_ty,
-            Err(e) => {
-                error!(
-                    "Unable to read property {} on notify clip for selection {clipboard:?}: {e}",
-                    self.target.xconn.atom_str(property)
-                );
-                return;
-            },
-        };
-        if property_ty == atoms[INCR] {
-            data_transfer.start_incr_receiver(xev);
-            return;
-        }
-
-        if xev.target == atoms[TARGETS] as c_ulong
-            || xev.target as xproto::Atom == xproto::AtomEnum::ATOM.into()
-        {
-            data_transfer.populate_targets(xev.selection as _, property_value);
-        } else if let Some(data) = data_transfer.send_clipboard_data(clipboard, property_value) {
-            app.window_event(&self.target, data.window(), data.into_event());
-        }
+        let finished = self.target.data_transfer_state.get_mut().clipboard_reply(xev);
+        self.deliver_data_transfers(finished, app);
     }
 
     fn configure_notify(&self, xev: &XConfigureEvent, app: &mut dyn ApplicationHandler) {
@@ -1056,9 +1027,8 @@ impl EventProcessor {
             self.process_dpi_change(app);
         }
 
-        if let Some(data) = self.target.data_transfer_state.get_mut().check_incr_receive_data(xev) {
-            app.window_event(&self.target, data.window(), data.into_event());
-        }
+        let finished = self.target.data_transfer_state.get_mut().check_incr_receive_data(xev);
+        self.deliver_data_transfers(finished, app);
         self.target.data_transfer_state.get_mut().check_incr_send_data(xev);
     }
 
