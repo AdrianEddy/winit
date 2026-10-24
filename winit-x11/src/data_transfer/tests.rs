@@ -1,5 +1,6 @@
 //! Unit tests for the selection and drag-and-drop logic that runs without an X server.
 
+use std::cell::RefCell;
 use std::ptr;
 
 use winit_core::data_transfer::{DataTransferSend, DataTransferSendBuilder, TypeHint};
@@ -622,4 +623,140 @@ fn every_fetch_ends_in_exactly_one_result() {
     results.extend(queue.complete_front(Ok(Vec::new())));
 
     assert_eq!(results.iter().map(|finished| finished.serial).collect::<Vec<_>>(), serials);
+}
+
+/// A drag of data dropped on window 5 by the source window 6, with one fetch outstanding.
+fn dropped_drag_with_a_fetch() -> DragState {
+    let mut drag = DragState {
+        target_window: 5,
+        finished: Some((5, 6)),
+        accepted: true,
+        ..Default::default()
+    };
+    drag.fetches.push(pending(drag.transfer_id, 5, Some(request(1, 10))));
+    drag
+}
+
+#[test]
+fn a_drop_is_finished_once_its_last_fetch_completes() {
+    let mut drag = dropped_drag_with_a_fetch();
+    assert_eq!(drag.drop_to_finish(), None, "a fetch is outstanding");
+
+    let finished = drag.complete_fetch(Ok(b"file:///tmp/a".to_vec())).expect("a fetch is pending");
+
+    assert_eq!(finished.id, drag.transfer_id);
+    assert_eq!(finished.window(), WindowId::from_raw(5));
+    assert_eq!(drag.drop_to_finish(), Some((5, 6)));
+}
+
+#[test]
+fn a_drop_is_finished_when_its_last_fetch_fails() {
+    let mut drag = dropped_drag_with_a_fetch();
+
+    let refused = io::Error::new(io::ErrorKind::Unsupported, "refused");
+    let finished = drag.complete_fetch(Err(refused)).expect("the failed fetch is completed");
+
+    assert_eq!(error_kind(&finished), Some(io::ErrorKind::Unsupported));
+    assert_eq!(drag.drop_to_finish(), Some((5, 6)));
+}
+
+#[test]
+fn a_drag_that_was_not_dropped_is_not_finished() {
+    let mut drag = DragState { target_window: 5, ..Default::default() };
+    drag.fetches.push(pending(drag.transfer_id, 5, Some(request(1, 10))));
+
+    let _ = drag.complete_fetch(Ok(Vec::new()));
+
+    assert_eq!(drag.drop_to_finish(), None);
+}
+
+#[test]
+fn a_reply_to_an_earlier_drag_does_not_answer_the_current_one() {
+    let drag = dropped_drag_with_a_fetch();
+    let (ty, request) = drag.fetches.front_request().expect("a conversion is outstanding");
+    let expected = |target| target == ty.atom();
+
+    assert!(!request.answered_by(expected, 2, UTF8_STRING_ATOM, 30), "another property");
+    assert!(!request.answered_by(expected, x11rb::NONE, UTF8_STRING_ATOM, 9), "refused earlier");
+    assert!(request.answered_by(expected, 1, UTF8_STRING_ATOM, 30));
+}
+
+/// `XdndFinished` names the target window, whether it accepted the drop, and the action it
+/// performed: `XdndActionCopy`, or `None` (0) for a refusal, not an atom.
+#[test]
+fn xdnd_finished_reports_a_refusal_with_no_action() {
+    let atoms = Atoms { XdndActionCopy: 21, ..atoms() };
+    // An `XdndDrop` onto the window 5 from the source window 6, with no drag in progress.
+    // SAFETY: X events are plain C data, valid when zeroed.
+    let mut drop: x11_dl::xlib::XClientMessageEvent = unsafe { std::mem::zeroed() };
+    drop.window = 5;
+    drop.data.set_long(0, 6);
+
+    let refusal = DropFinished::refusal_of(&drop);
+    assert_eq!(refusal, DropFinished { windows: (5, 6), accepted: false });
+    assert_eq!(refusal.message_data(&atoms), [5, 0, 0, 0, 0]);
+
+    let accepted = DropFinished { windows: (5, 6), accepted: true };
+    assert_eq!(accepted.message_data(&atoms), [5, 1, 21, 0, 0]);
+}
+
+/// `XdndStatus` names the target window, whether it accepts the drop, no rectangle, and the
+/// action it would perform: `XdndActionCopy`, or `None` (0) for a rejection, not an atom.
+#[test]
+fn xdnd_status_reports_a_rejection_with_no_action() {
+    let atoms = Atoms { XdndActionCopy: 21, ..atoms() };
+
+    assert_eq!(DndState::Rejected.message_data(5, &atoms), [5, 0, 0, 0, 0]);
+    assert_eq!(DndState::Accepted.message_data(5, &atoms), [5, 1, 0, 0, 21]);
+}
+
+/// Complete the last fetch of `dropped_drag_with_a_fetch`, deliver it to a handler that does
+/// `handle`, and settle the drop, with the function the event processor uses on the direct and
+/// INCR paths. Returns what `XdndFinished` reports, if it is sent: the windows, and whether the
+/// drop is accepted.
+fn settle_after_delivery(
+    handle: impl FnOnce(&mut DragState),
+) -> Option<((XWindow, XWindow), bool)> {
+    let drag = RefCell::new(Some(dropped_drag_with_a_fetch()));
+    let finished =
+        drag.borrow_mut().as_mut().and_then(|drag| drag.complete_fetch(Ok(b"x".to_vec())));
+    let mut handle = Some(handle);
+
+    // The handler reaches the drag through the shared state, as the application does: this
+    // panics if the state is still borrowed during the delivery.
+    let settled = deliver_then_settle(
+        &drag,
+        |state| state,
+        finished.into_iter().collect(),
+        |_| {
+            if let Some(handle) = handle.take() {
+                handle(drag.borrow_mut().as_mut().expect("the drag is open during the delivery"));
+            }
+        },
+    );
+
+    // The drag ends when, and only when, the drop is settled.
+    assert_eq!(drag.borrow().is_none(), settled.is_some());
+    settled.map(|finished| (finished.windows, finished.accepted))
+}
+
+#[test]
+fn a_drop_is_settled_after_its_last_fetch_is_delivered() {
+    assert_eq!(settle_after_delivery(|_| ()), Some(((5, 6), true)));
+}
+
+#[test]
+fn a_drop_refused_while_its_last_fetch_is_delivered_is_reported_refused() {
+    // What `set_valid_dnd_actions(id, &[])` does from the handler.
+    assert_eq!(settle_after_delivery(|drag| drag.accepted = false), Some(((5, 6), false)));
+}
+
+#[test]
+fn a_fetch_requested_while_the_last_fetch_is_delivered_keeps_the_drop_open() {
+    let settled = settle_after_delivery(|drag| {
+        let fetch = pending(drag.transfer_id, 5, Some(request(2, 20)));
+        drag.fetches.push(fetch);
+    });
+
+    assert_eq!(settled, None);
 }

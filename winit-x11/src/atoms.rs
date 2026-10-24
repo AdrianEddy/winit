@@ -128,8 +128,6 @@ atom_manager! {
     ImageXIcon: b"image/x-icon",
     ImageRaw: b"image/x-panasonic-raw",
 
-    NoneAtom: b"None",
-
     // Miscellaneous Atoms
     _GTK_THEME_VARIANT,
     _MOTIF_WM_HINTS,

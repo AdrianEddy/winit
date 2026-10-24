@@ -1,5 +1,6 @@
 //! Types related to data transfer (drag-and-drop and clipboard) on X11.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::os::raw::*;
@@ -21,7 +22,6 @@ use x11rb::errors::ReplyError;
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt};
 
-use crate::atoms::AtomName::NoneAtom as DndNone;
 use crate::atoms::*;
 use crate::event_loop::{CookieResultExt, X11Error};
 use crate::xdisplay::XConnection;
@@ -74,8 +74,9 @@ pub enum DndState {
 /// When the transfer failed, every read returns its error (and [`TypedData::try_read`] returns
 /// `None`): [`io::ErrorKind::Unsupported`] when the owner refused the conversion,
 /// [`io::ErrorKind::InvalidData`] when the reply could not be read,
-/// [`io::ErrorKind::ConnectionAborted`] when the owner changed or went away before the transfer
-/// completed, and [`io::ErrorKind::Other`] when the conversion could not be requested.
+/// [`io::ErrorKind::ConnectionAborted`] when the owner changed or went away, or the drag ended,
+/// before the transfer completed, and [`io::ErrorKind::Other`] when the conversion could not be
+/// requested.
 #[derive(Debug)]
 pub struct SelectionReader {
     type_: SelectionType,
@@ -156,8 +157,8 @@ pub struct DragState {
     pub source_window: xproto::Window,
     // Populated by Xdnd* event handlers
     pub target_window: xproto::Window,
-    // Populated by `fetch_data_transfer`
-    pub pending_fetch_types: VecDeque<(AsyncRequestSerial, SelectionType)>,
+    /// The fetches of the dragged data, populated by `fetch_data_transfer`
+    pub(crate) fetches: FetchQueue,
     pub finished: Option<(XWindow, XWindow)>,
     /// Whether the drag operation is accepted (or `None` if the user never indicated that it's
     /// accepted or rejected)
@@ -179,10 +180,26 @@ impl Default for DragState {
             types: Default::default(),
             source_window: Default::default(),
             target_window: Default::default(),
-            pending_fetch_types: Default::default(),
+            fetches: Default::default(),
             finished: None,
             accepted: Default::default(),
         }
+    }
+}
+
+impl DragState {
+    /// Complete the first fetch of the dragged data.
+    pub(crate) fn complete_fetch(
+        &mut self,
+        result: io::Result<Vec<u8>>,
+    ) -> Option<FinishedDataTransfer> {
+        self.fetches.complete_front(result)
+    }
+
+    /// The windows to send `XdndFinished` between, once the data was dropped and no fetch is
+    /// left: XDND asks the target to send it when it is done with the data.
+    pub(crate) fn drop_to_finish(&self) -> Option<(XWindow, XWindow)> {
+        self.finished.filter(|_| self.fetches.is_empty())
     }
 }
 
@@ -361,7 +378,7 @@ impl FetchQueue {
         self.fetches.push_back(fetch);
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.fetches.is_empty()
     }
 
@@ -582,6 +599,69 @@ pub(crate) enum OwnerChangeAction {
     AbandonAll { request_targets: bool },
 }
 
+/// What `XdndFinished` reports: the target and source windows, and whether the drop was accepted.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DropFinished {
+    pub(crate) windows: (XWindow, XWindow),
+    pub(crate) accepted: bool,
+}
+
+impl DropFinished {
+    /// The refusal of `drop`, an `XdndDrop` that arrived with no drag in progress here: it is
+    /// reported to the source window that the message names (`data.l[0]`).
+    pub(crate) fn refusal_of(drop: &x11_dl::xlib::XClientMessageEvent) -> Self {
+        let windows = (drop.window as XWindow, drop.data.get_long(0) as XWindow);
+        Self { windows, accepted: false }
+    }
+
+    /// The data of the `XdndFinished` message (XDND): the target window, whether it accepted the
+    /// drop, and the action it performed, `XdndActionCopy` for an accepted drop and `None` (0)
+    /// for a refused one.
+    pub(crate) fn message_data(&self, atoms: &Atoms) -> [u32; 5] {
+        let (target_window, _) = self.windows;
+        let (accepted, action) =
+            if self.accepted { (1, atoms[XdndActionCopy]) } else { (0, x11rb::NONE) };
+        [target_window, accepted, action, 0, 0]
+    }
+}
+
+impl DndState {
+    /// The data of the `XdndStatus` message that `this_window` sends (XDND): the target window,
+    /// whether it accepts the drop, no rectangle, and the action it would perform,
+    /// `XdndActionCopy` when it accepts and `None` (0) when it rejects.
+    pub(crate) fn message_data(self, this_window: xproto::Window, atoms: &Atoms) -> [u32; 5] {
+        let (accepted, action) = match self {
+            DndState::Accepted => (1, atoms[XdndActionCopy]),
+            DndState::Rejected => (0, x11rb::NONE),
+        };
+        [this_window, accepted, 0, 0, action]
+    }
+}
+
+/// Deliver the fetches that a reply completed, then settle the drop: once the data was dropped
+/// and no fetch is left, end the drag (which `drag` finds in `state`) and return what
+/// `XdndFinished` is to report.
+///
+/// The drop is settled after the delivery, during which `state` is not borrowed: the
+/// application handles the last `DataTransferReceived` of a drop while the drag is still open, so
+/// it can still read the data transfer, fetch more, or refuse the drop, and `XdndFinished`
+/// reports what it decided.
+pub(crate) fn deliver_then_settle<S>(
+    state: &RefCell<S>,
+    drag: impl FnOnce(&mut S) -> &mut Option<DragState>,
+    finished: Vec<FinishedDataTransfer>,
+    mut deliver: impl FnMut(FinishedDataTransfer),
+) -> Option<DropFinished> {
+    for finished in finished {
+        deliver(finished);
+    }
+    let mut state = state.borrow_mut();
+    let drag = drag(&mut state);
+    let windows = drag.as_ref()?.drop_to_finish()?;
+    let accepted = drag.take()?.accepted;
+    Some(DropFinished { windows, accepted })
+}
+
 /// A reply received incrementally (INCR).
 #[derive(Debug)]
 struct IncrReceive {
@@ -605,6 +685,8 @@ enum IncrTarget {
     Targets(ClipboardSelectionType),
     /// The conversion of the first fetch of a clipboard.
     Fetch(ClipboardSelectionType),
+    /// The conversion of the first fetch of the dragged data.
+    Drag,
 }
 
 impl ClipboardState {
@@ -1081,6 +1163,11 @@ impl DataTransferState {
         self.selection_window
     }
 
+    /// The drag in progress, if any.
+    pub(crate) fn drag_mut(&mut self) -> &mut Option<DragState> {
+        &mut self.state
+    }
+
     pub fn state(&self) -> Option<&DragState> {
         self.state.as_ref()
     }
@@ -1113,27 +1200,13 @@ impl DataTransferState {
         self.state.take()
     }
 
-    pub unsafe fn send_finished(
-        &self,
-        this_window: xproto::Window,
-        target_window: xproto::Window,
-    ) -> Result<(), X11Error> {
+    /// Tell the source that the drop is finished (`XdndFinished`), reporting `finished`.
+    pub unsafe fn send_finished(&self, finished: &DropFinished) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
-        let Some(state) = &self.state else {
-            return Err(X11Error::UnexpectedNull(
-                "Drag-and-drop state was not initialized (called `send_finished` before XdndEnter",
-            ));
-        };
-        let (accepted, action) =
-            if state.accepted { (1, atoms[XdndActionCopy]) } else { (0, atoms[DndNone]) };
+        let (_, source_window) = finished.windows;
+        let data = finished.message_data(atoms);
         self.xconn
-            .send_client_msg(target_window, target_window, atoms[XdndFinished] as _, None, [
-                this_window,
-                accepted,
-                action as _,
-                0,
-                0,
-            ])?
+            .send_client_msg(source_window, source_window, atoms[XdndFinished] as _, None, data)?
             .ignore_error();
 
         Ok(())
@@ -1158,33 +1231,12 @@ impl DataTransferState {
         status: DndState,
     ) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
-        let (accepted, action) = match status {
-            DndState::Accepted => (1, atoms[XdndActionCopy]),
-            DndState::Rejected => (0, atoms[DndNone]),
-        };
+        let data = status.message_data(this_window, atoms);
         self.xconn
-            .send_client_msg(target_window, target_window, atoms[XdndStatus] as _, None, [
-                this_window,
-                accepted,
-                0,
-                0,
-                action as _,
-            ])?
+            .send_client_msg(target_window, target_window, atoms[XdndStatus] as _, None, data)?
             .ignore_error();
 
         Ok(())
-    }
-
-    pub fn read_data(
-        &self,
-        window: xproto::Window,
-        type_: SelectionType,
-    ) -> Result<SelectionReader, util::GetPropertyError> {
-        let atoms = self.xconn.atoms();
-        let type_atom = type_.atom();
-        let bytes = self.xconn.get_property(window, atoms[XdndSelection], type_atom)?;
-
-        Ok(SelectionReader { type_, result: Ok(bytes) })
     }
 
     /// Gets the [`ClipboardSelectionType`] associated with the specified [`DataTransferId`].
@@ -1393,9 +1445,11 @@ impl DataTransferState {
 
     /// The properties that outstanding conversions store their replies in.
     fn busy_properties(&self) -> Vec<xproto::Atom> {
+        let drag = self.state.iter().filter_map(|state| state.fetches.front_request());
         self.clipboards
             .iter()
             .flat_map(ClipboardState::outstanding_requests)
+            .chain(drag.map(|(_, request)| request))
             .map(|request| request.property)
             .collect()
     }
@@ -1544,6 +1598,7 @@ impl DataTransferState {
                 Vec::new()
             },
             IncrTarget::Fetch(clipboard) => self.complete_clipboard_fetch(clipboard, result),
+            IncrTarget::Drag => self.complete_drag_fetch(result),
         }
     }
 
@@ -1750,40 +1805,115 @@ impl DataTransferState {
         &mut self,
         type_: &dyn TransferType,
     ) -> Result<AsyncRequestSerial, TransferError> {
-        let type_ = type_
+        let ty = type_
             .cast_ref::<SelectionType>()
             .or_else(|| self.find_type_by_hint(type_.hint()?))
             .cloned()
             .ok_or(TransferError::Failed)?;
 
-        let Some(state) = self.state.as_mut() else {
+        let Some(state) = self.state.as_ref() else {
             return Err(TransferError::Failed);
         };
 
-        // If it's non-empty, assume that we're still waiting on some other fetch operation.
-        // The `SelectionNotify` handler will send a new `convert_selection` event if any
-        // more are on the stack.
-        let should_emit_convert_selection = state.pending_fetch_types.is_empty();
+        // The first fetch's conversion is requested now, so that a failure to request it is
+        // returned rather than delivered. A later fetch waits for the ones before it. The drop
+        // target converts the selection into a property on its own window.
+        let request = if state.fetches.is_empty() {
+            let mut busy = self.busy_properties();
+            let request = request_conversion(
+                &self.xconn,
+                &mut self.properties,
+                &mut busy,
+                state.target_window,
+                self.xconn.atoms()[XdndSelection],
+                ty.atom(),
+            )
+            .map_err(|err| os_error!(format!("could not convert the selection: {err}")))?;
+            Some(request)
+        } else {
+            None
+        };
 
-        let atom = type_.atom();
-        let selection = self.xconn.atoms()[XdndSelection];
-
-        if should_emit_convert_selection {
-            // TODO: The result is stored into a property with the same name as the selection.
-            // Consider using a different name to avoid conflict.
-            if let Err(e) =
-                self.xconn.convert_selection(state.target_window, selection, atom, selection)
-            {
-                return Err(TransferError::Os(os_error!(format!(
-                    "could not convert selection: {e}"
-                ))));
-            }
-        }
-
+        let Some(state) = self.state.as_mut() else {
+            return Err(TransferError::Failed);
+        };
         let serial = AsyncRequestSerial::get();
-        state.pending_fetch_types.push_back((serial, type_));
+        let window = crate::event_loop::mkwid(state.target_window);
+        state.fetches.push(PendingFetch { id: state.transfer_id, serial, ty, window, request });
 
         Ok(serial)
+    }
+
+    /// Handle a `SelectionNotify` for `XdndSelection`: the reply to a conversion of the dragged
+    /// data. Returns the fetches it completes.
+    #[must_use]
+    pub fn drag_reply(&mut self, xev: &XSelectionEvent) -> Vec<FinishedDataTransfer> {
+        let requestor = xev.requestor as xproto::Window;
+        let property = xev.property as xproto::Atom;
+        let target = xev.target as xproto::Atom;
+
+        let answered = self.state.as_ref().is_some_and(|state| {
+            state.target_window == requestor
+                && state.fetches.front_request().is_some_and(|(ty, request)| {
+                    let expected = |target| target == ty.atom();
+                    request.answered_by(expected, property, target, xev.serial as u64)
+                })
+        });
+        if !answered {
+            self.discard_stale_reply(requestor, property);
+            return Vec::new();
+        }
+
+        let incr = self.xconn.atoms()[INCR];
+        match reply_outcome(property, incr, || self.read_reply(requestor, property)) {
+            ReplyOutcome::Incremental => {
+                self.clip_incr_receive.push(IncrReceive {
+                    window: requestor,
+                    property,
+                    data: Vec::new(),
+                    target: IncrTarget::Drag,
+                });
+                Vec::new()
+            },
+            ReplyOutcome::Data(data) => self.complete_drag_fetch(Ok(data)),
+            ReplyOutcome::Failed(err) => self.complete_drag_fetch(Err(err)),
+        }
+    }
+
+    /// Complete the first fetch of the dragged data and request the conversion of the next one.
+    ///
+    /// The drop is settled by [`deliver_then_settle`] once the fetches are delivered.
+    #[must_use]
+    fn complete_drag_fetch(&mut self, result: io::Result<Vec<u8>>) -> Vec<FinishedDataTransfer> {
+        let finished = self.state.as_mut().and_then(|state| state.complete_fetch(result));
+        let mut finished: Vec<_> = finished.into_iter().collect();
+        finished.extend(self.start_drag_fetch());
+        finished
+    }
+
+    /// Request the conversion of the first fetch of the dragged data, unless it has one. Returns
+    /// the fetches whose conversion could not be requested.
+    #[must_use]
+    fn start_drag_fetch(&mut self) -> Vec<FinishedDataTransfer> {
+        let mut busy = self.busy_properties();
+        let Self { xconn, state, properties, .. } = self;
+        let Some(state) = state.as_mut() else {
+            return Vec::new();
+        };
+        let (requestor, selection) = (state.target_window, xconn.atoms()[XdndSelection]);
+        state.fetches.start_front(|ty| {
+            request_conversion(xconn, properties, &mut busy, requestor, selection, ty.atom())
+        })
+    }
+
+    /// End the drag, completing its pending fetches with `ConnectionAborted`. Returns the drag,
+    /// and the fetches it abandons.
+    #[must_use]
+    pub fn end_drag(&mut self) -> Option<(DragState, Vec<FinishedDataTransfer>)> {
+        let mut state = self.state.take()?;
+        let abandoned = state.fetches.abandon_while(|_| true, "the drag ended");
+        self.drop_orphan_receives();
+        Some((state, abandoned))
     }
 
     /// Fetch the clipboard's data of type `type_`, delivering it to `window`.
