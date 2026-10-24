@@ -2,10 +2,10 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::io;
 use std::os::raw::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::{fmt, io};
 
 use winit_core::data_transfer::{
     DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
@@ -62,15 +62,33 @@ pub enum DndState {
     Rejected,
 }
 
+/// The data of a selection, received for one fetch.
+///
+/// When the transfer failed, every read returns its error (and [`TypedData::try_read`] returns
+/// `None`): [`io::ErrorKind::Unsupported`] when the owner refused the conversion,
+/// [`io::ErrorKind::InvalidData`] when the reply could not be read,
+/// [`io::ErrorKind::ConnectionAborted`] when the owner changed or went away before the transfer
+/// completed, and [`io::ErrorKind::Other`] when the conversion could not be requested.
 #[derive(Debug)]
 pub struct SelectionReader {
     type_: SelectionType,
-    data: Vec<u8>,
+    result: Result<Vec<u8>, Arc<io::Error>>,
+}
+
+impl SelectionReader {
+    fn data(&self) -> io::Result<&[u8]> {
+        self.result.as_deref().map_err(|err| io::Error::new(err.kind(), Arc::clone(err)))
+    }
 }
 
 impl TypedData for SelectionReader {
     fn try_read(&self) -> Option<Box<dyn io::BufRead>> {
-        Some(Box::new(io::Cursor::new(self.data.clone())))
+        let data = self.result.as_ref().ok()?;
+        Some(Box::new(io::Cursor::new(data.clone())))
+    }
+
+    fn try_as_bytes(&self) -> io::Result<Vec<u8>> {
+        self.data().map(ToOwned::to_owned)
     }
 
     fn type_(&self) -> &dyn TransferType {
@@ -96,12 +114,13 @@ impl TypedData for SelectionReader {
             String::from_utf16(&utf16).map_err(invalid_data)
         }
 
+        let data = self.data()?;
         match self.type_.hint() {
-            Some(TypeHint::Plaintext) | Some(TypeHint::Html) => std::str::from_utf8(&self.data)
+            Some(TypeHint::Plaintext) | Some(TypeHint::Html) => std::str::from_utf8(data)
                 .map(|str| str.to_owned())
                 .map_err(invalid_data)
-                .or_else(|_| decode_utf16_bytes(&self.data)),
-            Some(TypeHint::UriList) => String::from_utf8(self.data.clone()).map_err(invalid_data),
+                .or_else(|_| decode_utf16_bytes(data)),
+            Some(TypeHint::UriList) => String::from_utf8(data.to_vec()).map_err(invalid_data),
             _ => Err(io::ErrorKind::InvalidData.into()),
         }
     }
@@ -201,17 +220,6 @@ impl ClipboardSelectionType {
     pub fn iter() -> impl Iterator<Item = Self> {
         [Self::Primary, Self::Secondary, Self::Clipboard].into_iter()
     }
-
-    /// An atom representing a property that can be used for reading (without conflicting with other
-    /// clipboards that might also be reading their TARGETS)
-    #[must_use]
-    pub fn property_atom(self, atoms: &crate::atoms::Atoms) -> xproto::Atom {
-        match self {
-            Self::Primary => atoms[WINIT_TARGETS_PRIMARY],
-            Self::Secondary => atoms[WINIT_TARGETS_SECONDARY],
-            Self::Clipboard => atoms[WINIT_TARGETS_CLIPBOARD],
-        }
-    }
 }
 
 /// State for the INCR clipboard protocol. The protocol works as follows:
@@ -224,9 +232,11 @@ impl ClipboardSelectionType {
 /// - Copier puts then next chunk of data
 /// - etc.
 /// - When the copier puts an empty chunk of data, the sequence is over
+///
+/// This is the state of the copier; the paster's is [`IncrReceive`].
 #[derive(Debug)]
 struct IncrState {
-    /// The partial bytes of data
+    /// The bytes still to send
     data: Vec<u8>,
     /// The place where the INCR protocol takes place (is modified with each chunk) e.g.
     /// CLIPBOARD or META_SELECTION (not necessarily the same as the selection)
@@ -248,18 +258,10 @@ pub struct ClipboardState {
     x11_serial: u64,
     /// Cached types available for pasting
     types: Arc<[SelectionType]>,
-    /// A list of the fetch requests with the first one being in progress
-    pending_fetch_types: VecDeque<PendingFetch>,
-}
-
-/// A fetch of the clipboard requested with `fetch_data_transfer`.
-#[derive(Debug)]
-pub(crate) struct PendingFetch {
-    serial: AsyncRequestSerial,
-    ty: SelectionType,
-    /// The window to deliver the data to: the clipboard is not tied to a window, so it is chosen
-    /// when the fetch is requested.
-    window: WindowId,
+    /// The outstanding conversion to `TARGETS`, which lists the types available for pasting.
+    targets_request: Option<Request>,
+    /// The fetches of the selection's data, the first one being in progress
+    fetches: FetchQueue,
 }
 
 impl Default for ClipboardState {
@@ -269,9 +271,276 @@ impl Default for ClipboardState {
             transfer_serial: generate_transfer_id(),
             x11_serial: u64::MAX,
             types: Default::default(),
-            pending_fetch_types: Default::default(),
+            targets_request: None,
+            fetches: Default::default(),
         }
     }
+}
+
+/// A conversion requested from a selection owner and not answered yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Request {
+    /// The property on the requestor window that the owner was asked to store its reply in.
+    /// Outstanding conversions never share a property, so the property of a reply names the
+    /// request it answers.
+    property: xproto::Atom,
+    /// The sequence number of the `ConvertSelection` request.
+    sequence: u64,
+}
+
+impl Request {
+    /// Whether a `SelectionNotify` with `property` and `target`, whose sequence number is
+    /// `event_serial`, answers this request, a conversion to a target that `expected_target`
+    /// accepts.
+    ///
+    /// ICCCM: a refusal carries the property `None`, so it names no request. It can only answer
+    /// this one if it was generated after the server processed this request, which its sequence
+    /// number tells: an event carries the sequence number of the last request the server had
+    /// processed for this client. The low 32 bits are compared with wrapping, which is exact for
+    /// requests less than 2^31 apart.
+    fn answered_by(
+        &self,
+        expected_target: impl Fn(xproto::Atom) -> bool,
+        property: xproto::Atom,
+        target: xproto::Atom,
+        event_serial: u64,
+    ) -> bool {
+        expected_target(target)
+            && if property == x11rb::NONE {
+                (event_serial as u32).wrapping_sub(self.sequence as u32) as i32 >= 0
+            } else {
+                property == self.property
+            }
+    }
+}
+
+/// A fetch requested with `fetch_data_transfer`, until its `DataTransferReceived`.
+#[derive(Debug)]
+pub(crate) struct PendingFetch {
+    /// The data transfer the fetch was requested from.
+    id: DataTransferId,
+    serial: AsyncRequestSerial,
+    ty: SelectionType,
+    /// The window to deliver the data to. The clipboard is not tied to a window, so it is chosen
+    /// when the fetch is requested.
+    window: WindowId,
+    /// The conversion of the fetch, once requested; only the first fetch of a queue has one.
+    request: Option<Request>,
+}
+
+impl PendingFetch {
+    fn finish(self, result: io::Result<Vec<u8>>) -> FinishedDataTransfer {
+        let value = Arc::new(SelectionReader { type_: self.ty, result: result.map_err(Arc::new) });
+        FinishedDataTransfer { id: self.id, serial: self.serial, value, window: self.window }
+    }
+}
+
+/// The fetches of one selection, completed in the order they were requested: only the first one
+/// has a conversion outstanding.
+///
+/// Every fetch ends in exactly one [`FinishedDataTransfer`]: with its data, or with an error when
+/// its conversion is refused, fails, cannot be requested or is abandoned.
+#[derive(Debug, Default)]
+pub(crate) struct FetchQueue {
+    fetches: VecDeque<PendingFetch>,
+}
+
+impl FetchQueue {
+    fn push(&mut self, fetch: PendingFetch) {
+        self.fetches.push_back(fetch);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fetches.is_empty()
+    }
+
+    /// The type and the outstanding conversion of the first fetch.
+    fn front_request(&self) -> Option<(&SelectionType, Request)> {
+        let front = self.fetches.front()?;
+        Some((&front.ty, front.request?))
+    }
+
+    /// Request the conversion of the first fetch, unless it has one. A fetch whose conversion
+    /// cannot be requested completes with an error, and the next one is tried.
+    fn start_front<E: fmt::Display>(
+        &mut self,
+        mut convert: impl FnMut(&SelectionType) -> Result<Request, E>,
+    ) -> Vec<FinishedDataTransfer> {
+        let mut failed = Vec::new();
+        while let Some(front) = self.fetches.front_mut() {
+            if front.request.is_some() {
+                break;
+            }
+            match convert(&front.ty) {
+                Ok(request) => front.request = Some(request),
+                Err(err) => failed.extend(self.complete_front(Err(io::Error::other(format!(
+                    "could not request the conversion of the selection: {err}"
+                ))))),
+            }
+        }
+        failed
+    }
+
+    /// Complete the first fetch.
+    fn complete_front(&mut self, result: io::Result<Vec<u8>>) -> Option<FinishedDataTransfer> {
+        Some(self.fetches.pop_front()?.finish(result))
+    }
+
+    /// Abandon the fetches at the front of the queue that `abandon` selects, completing each
+    /// with an [`io::ErrorKind::ConnectionAborted`] error.
+    fn abandon_while(
+        &mut self,
+        mut abandon: impl FnMut(&PendingFetch) -> bool,
+        why: &str,
+    ) -> Vec<FinishedDataTransfer> {
+        let mut abandoned = Vec::new();
+        while self.fetches.front().is_some_and(&mut abandon) {
+            let aborted = io::Error::new(io::ErrorKind::ConnectionAborted, why.to_owned());
+            abandoned.extend(self.complete_front(Err(aborted)));
+        }
+        abandoned
+    }
+}
+
+/// The properties that conversions store their replies in, used in turn so that a late reply to
+/// an abandoned conversion is not taken for the reply to a newer one.
+#[derive(Debug)]
+pub(crate) struct PropertyPool {
+    atoms: Vec<xproto::Atom>,
+    next: usize,
+}
+
+impl PropertyPool {
+    /// How many properties there are: comfortably more than the conversions that can be
+    /// outstanding at once (one fetch and one `TARGETS` per selection, and one fetch of a drag).
+    const SIZE: usize = 16;
+
+    /// The next property in turn that is not `busy` (in use by an outstanding conversion), which
+    /// is then added to `busy`.
+    fn take(&mut self, busy: &mut Vec<xproto::Atom>) -> Option<xproto::Atom> {
+        for _ in 0..self.atoms.len() {
+            let atom = self.atoms[self.next];
+            self.next = (self.next + 1) % self.atoms.len();
+            if !busy.contains(&atom) {
+                busy.push(atom);
+                return Some(atom);
+            }
+        }
+        None
+    }
+}
+
+/// Request the conversion of `selection` to `target` into a property from `properties` that is
+/// not `busy`.
+fn request_conversion(
+    xconn: &XConnection,
+    properties: &mut PropertyPool,
+    busy: &mut Vec<xproto::Atom>,
+    requestor: xproto::Window,
+    selection: xproto::Atom,
+    target: xproto::Atom,
+) -> Result<Request, X11Error> {
+    let property =
+        properties.take(busy).ok_or(X11Error::UnexpectedNull("free conversion property"))?;
+    let sequence = xconn.convert_selection(requestor, selection, target, property)?;
+    Ok(Request { property, sequence })
+}
+
+/// What a `SelectionNotify` for one of the clipboards answers.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardReply {
+    /// The outstanding conversion to `TARGETS`.
+    Targets,
+    /// The conversion of the first fetch.
+    Fetch,
+    /// No outstanding conversion: a late reply to a conversion that was abandoned.
+    Stale,
+}
+
+/// What the reply to a conversion delivered.
+#[derive(Debug)]
+pub(crate) enum ReplyOutcome {
+    /// The data, read from the reply's property.
+    Data(Vec<u8>),
+    /// The owner sends the data incrementally (INCR), in property changes to come.
+    Incremental,
+    /// The conversion failed.
+    Failed(io::Error),
+}
+
+/// Interpret the reply to a conversion, stored in `property`: `read` reads (and deletes) the
+/// property, returning its type and contents.
+pub(crate) fn reply_outcome(
+    property: xproto::Atom,
+    incr: xproto::Atom,
+    read: impl FnOnce() -> Result<(xproto::Atom, Vec<u8>), util::GetPropertyError>,
+) -> ReplyOutcome {
+    if property == x11rb::NONE {
+        return ReplyOutcome::Failed(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the selection owner refused the conversion",
+        ));
+    }
+
+    match read() {
+        Ok((ty, _)) if ty == incr => ReplyOutcome::Incremental,
+        Ok((_, data)) => ReplyOutcome::Data(data),
+        Err(err) => ReplyOutcome::Failed(io::Error::new(io::ErrorKind::InvalidData, err)),
+    }
+}
+
+/// How an XFixes selection event changed the owner of a selection.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerChange {
+    /// The selection window took it: this application set new contents.
+    Ours,
+    /// Another client took it.
+    Theirs,
+    /// Nobody owns it any more: its owner set no owner, or its window was destroyed, or its
+    /// client closed its connection.
+    Gone,
+}
+
+impl OwnerChange {
+    pub(crate) fn classify(
+        subtype: c_int,
+        owner: xproto::Window,
+        selection_window: xproto::Window,
+    ) -> Self {
+        let set_owner = c_int::from(u8::from(xfixes::SelectionEvent::SET_SELECTION_OWNER));
+        if subtype != set_owner || owner == x11rb::NONE {
+            Self::Gone
+        } else if owner == selection_window {
+            Self::Ours
+        } else {
+            Self::Theirs
+        }
+    }
+}
+
+/// A reply received incrementally (INCR).
+#[derive(Debug)]
+struct IncrReceive {
+    /// The requestor window, and the property the chunks are stored in.
+    window: xproto::Window,
+    property: xproto::Atom,
+    /// The chunks received so far.
+    data: Vec<u8>,
+    /// What the reply answers.
+    target: IncrTarget,
+}
+
+/// Keep the incremental receptions whose property an outstanding conversion still uses (`busy`).
+fn retain_outstanding_receives(receives: &mut Vec<IncrReceive>, busy: &[xproto::Atom]) {
+    receives.retain(|receive| busy.contains(&receive.property));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncrTarget {
+    /// The conversion to `TARGETS` of a clipboard.
+    Targets(ClipboardSelectionType),
+    /// The conversion of the first fetch of a clipboard.
+    Fetch(ClipboardSelectionType),
 }
 
 impl ClipboardState {
@@ -288,18 +557,36 @@ impl ClipboardState {
         }
         Selection::new(Arc::clone(&self.types))
     }
-    /// Adds a request to the fetch, returning true if the fetch should start immediately
-    pub(crate) fn add_to_fetch(&mut self, fetch: PendingFetch) -> bool {
-        self.pending_fetch_types.push_back(fetch);
-        self.pending_fetch_types.len() == 1
+    /// The conversions of this selection that are outstanding.
+    fn outstanding_requests(&self) -> impl Iterator<Item = Request> + '_ {
+        let fetch = self.fetches.front_request().map(|(_, request)| request);
+        self.targets_request.into_iter().chain(fetch)
     }
 
-    /// Complete the fetch in progress with its data, delivered to the window chosen when it was
-    /// requested.
-    pub(crate) fn finish_fetch(&mut self, data: Vec<u8>) -> Option<FinishedDataTransfer> {
-        let PendingFetch { serial, ty, window } = self.pending_fetch_types.pop_front()?;
-        let value = Arc::new(SelectionReader { type_: ty, data });
-        Some(FinishedDataTransfer { id: self.transfer_serial, serial, value, window })
+    /// Which outstanding conversion a `SelectionNotify` with `property` and `target`, whose
+    /// sequence number is `event_serial`, answers.
+    pub(crate) fn match_reply(
+        &self,
+        atoms: &Atoms,
+        property: xproto::Atom,
+        target: xproto::Atom,
+        event_serial: u64,
+    ) -> ClipboardReply {
+        let targets = |target| target == atoms[TARGETS] || target == xproto::AtomEnum::ATOM.into();
+        if self
+            .targets_request
+            .is_some_and(|request| request.answered_by(targets, property, target, event_serial))
+        {
+            return ClipboardReply::Targets;
+        }
+
+        if self.fetches.front_request().is_some_and(|(ty, request)| {
+            request.answered_by(|target| target == ty.atom(), property, target, event_serial)
+        }) {
+            return ClipboardReply::Fetch;
+        }
+
+        ClipboardReply::Stale
     }
 
     /// From the list of types available on the clipboard, find the first available type that
@@ -458,9 +745,11 @@ pub struct DataTransferState {
     /// recipient using the INCR ICCCM protocol
     clip_incr_send: Vec<IncrState>,
     /// Contains the partially received message from the clipboard using the INCR ICCCM protocol
-    clip_incr_receive: Vec<IncrState>,
+    clip_incr_receive: Vec<IncrReceive>,
     /// See [`incr_threshold`].
     incr_threshold: usize,
+    /// The properties that conversions store their replies in.
+    properties: PropertyPool,
 }
 
 #[derive(Debug)]
@@ -626,7 +915,11 @@ impl DataTransferState {
                     conn.xfixes_select_selection_input(
                         root,
                         item.selection_atom(xconn.atoms()),
-                        xfixes::SelectionEventMask::SET_SELECTION_OWNER,
+                        // An owner whose window is destroyed or whose client exits will never
+                        // answer the conversions it was asked for.
+                        xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                            | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                            | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
                     )
                     .expect_then_ignore_error("Failed to select selection owner changes");
                 }
@@ -636,7 +929,14 @@ impl DataTransferState {
 
         let incr_threshold = incr_threshold(conn.maximum_request_bytes());
 
-        let data_transfer = DataTransferState {
+        let properties = (0..PropertyPool::SIZE)
+            .map(|index| conn.intern_atom(false, format!("WINIT_SELECTION_{index}").as_bytes()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|cookie| cookie.reply().map(|reply| reply.atom))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut data_transfer = DataTransferState {
             xconn,
             selection_window,
             state: Default::default(),
@@ -644,6 +944,7 @@ impl DataTransferState {
             clip_incr_send: Default::default(),
             clip_incr_receive: Default::default(),
             incr_threshold,
+            properties: PropertyPool { atoms: properties, next: 0 },
         };
 
         // Request the types on offer in the selections that already have an owner.
@@ -764,7 +1065,7 @@ impl DataTransferState {
         let type_atom = type_.atom();
         let bytes = self.xconn.get_property(window, atoms[XdndSelection], type_atom)?;
 
-        Ok(SelectionReader { type_, data: bytes })
+        Ok(SelectionReader { type_, result: Ok(bytes) })
     }
 
     /// Gets the [`ClipboardSelectionType`] associated with the specified [`DataTransferId`].
@@ -965,111 +1266,199 @@ impl DataTransferState {
         Ok(())
     }
 
-    /// Setup an empty buffer to receive data via the INCR protocol
-    pub fn start_incr_receiver(&mut self, xev: &XSelectionEvent) {
-        let property = xev.property as _;
-        let target = xev.target as _;
-        let Some(clipboard) =
-            ClipboardSelectionType::from_atom(self.xconn.atoms(), xev.selection as _)
-        else {
-            warn!("Invalid clipboard for starting INCR receiver");
-            return;
-        };
-        let ty = SelectionType::new(self.xconn.atoms(), target);
-        trace!(
-            "Starting INCR receiver {ty:?} property {} target {}  requestor {}",
-            self.xconn.atom_str(property),
-            self.xconn.atom_str(target),
-            xev.requestor
-        );
-        self.clip_incr_receive.push(IncrState { data: Vec::new(), property, ty, clipboard });
-    }
-
-    /// Check if we are the ones receiving and there is some new value for the clipboard property
-    #[must_use]
-    pub fn check_incr_receive_data(
-        &mut self,
-        xev: &XPropertyEvent,
-    ) -> Option<FinishedDataTransfer> {
-        let atom = xev.atom as xproto::Atom;
-        let xwindow = xev.window as xproto::Window;
-
-        // We only care about new values, of the properties our conversions are received in
-        if xev.state as u32 != xproto::Property::NEW_VALUE.into()
-            || xwindow != self.selection_window
-        {
-            return None;
-        }
-
-        let index = self
-            .clip_incr_receive
+    /// The properties that outstanding conversions store their replies in.
+    fn busy_properties(&self) -> Vec<xproto::Atom> {
+        self.clipboards
             .iter()
-            .position(|IncrState { property, .. }| *property == atom)?;
-
-        let IncrState { data, .. } = &mut self.clip_incr_receive[index];
-
-        let (_, read_bytes) = match self.xconn.get_dynamic_property(atom, xwindow, data) {
-            Ok(value) => value,
-            Err(e) => {
-                error!("Unable to read property to check INCR receive: {e}");
-                self.clip_incr_receive.remove(index); // Delete if broken to avoid memory leak
-                return None;
-            },
-        };
-        if read_bytes != 0 {
-            return None;
-        }
-        let IncrState { data, property, ty, clipboard } = self.clip_incr_receive.remove(index);
-        trace!(
-            "We are done receiving from {} ty {}",
-            self.xconn.atom_str(property),
-            self.xconn.atom_str(ty.atom())
-        );
-
-        self.send_clipboard_data(clipboard, data)
+            .flat_map(ClipboardState::outstanding_requests)
+            .map(|request| request.property)
+            .collect()
     }
 
-    /// Start the next clipboard fetch from the queue.
-    pub fn do_next_clipboard_fetch(&mut self, clipboard: ClipboardSelectionType) {
-        let selection = clipboard.selection_atom(self.xconn.atoms());
-        while let Some(PendingFetch { ty, .. }) =
-            self.get_clipboard(clipboard).pending_fetch_types.front()
-        {
-            match self.xconn.convert_selection(
-                self.selection_window,
-                selection,
-                ty.atom(),
-                selection,
-            ) {
-                Ok(()) => {
-                    trace!("Converting next selection {}", self.xconn.atom_str(ty.atom()));
-                    return;
-                },
-                Err(e) => {
-                    self.get_clipboard_mut(clipboard).pending_fetch_types.pop_front();
-                    error!("Could not convert next selection so skipping: {e}");
-                    continue;
-                },
+    /// Forget the incremental receptions whose conversion was abandoned, so that their late
+    /// chunks are ignored.
+    fn drop_orphan_receives(&mut self) {
+        let busy = self.busy_properties();
+        retain_outstanding_receives(&mut self.clip_incr_receive, &busy);
+    }
+
+    /// Ignore a late reply to an abandoned conversion, deleting the property it was stored in
+    /// unless an outstanding conversion uses it.
+    fn discard_stale_reply(&self, requestor: xproto::Window, property: xproto::Atom) {
+        trace!("Ignoring a selection reply that answers no outstanding conversion");
+        if property != x11rb::NONE && !self.busy_properties().contains(&property) {
+            if let Ok(cookie) = self.xconn.xcb_connection().delete_property(requestor, property) {
+                cookie.ignore_error();
             }
         }
     }
 
-    /// Using the pending clipboard values, send the data to the app with a
-    /// [`WindowEvent::DataTransferReceived`].
+    /// Read (and delete) the property a reply was stored in, returning its type and contents.
+    fn read_reply(
+        &self,
+        window: xproto::Window,
+        property: xproto::Atom,
+    ) -> Result<(xproto::Atom, Vec<u8>), util::GetPropertyError> {
+        let mut data = Vec::new();
+        let (ty, _) = self.xconn.get_dynamic_property(property, window, &mut data)?;
+        Ok((ty, data))
+    }
+
+    /// Handle a `SelectionNotify` for one of the clipboards: the reply to one of our conversions.
+    /// Returns the fetches it completes.
     #[must_use]
-    pub fn send_clipboard_data(
-        &mut self,
-        clipboard: ClipboardSelectionType,
-        data: Vec<u8>,
-    ) -> Option<FinishedDataTransfer> {
-        let Some(finished) = self.get_clipboard_mut(clipboard).finish_fetch(data) else {
-            warn!("Got finished fetch but no fetches were pending");
-            return None;
+    pub fn clipboard_reply(&mut self, xev: &XSelectionEvent) -> Vec<FinishedDataTransfer> {
+        let requestor = xev.requestor as xproto::Window;
+        let property = xev.property as xproto::Atom;
+        let target = xev.target as xproto::Atom;
+
+        // Our conversions are received on the selection window: anything else is not ours
+        if requestor != self.selection_window {
+            return Vec::new();
+        }
+        let atoms = self.xconn.atoms();
+        let Some(clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _) else {
+            return Vec::new();
         };
 
-        self.do_next_clipboard_fetch(clipboard);
+        let incr = atoms[INCR];
+        let reply =
+            self.get_clipboard(clipboard).match_reply(atoms, property, target, xev.serial as u64);
+        match reply {
+            ClipboardReply::Stale => {
+                self.discard_stale_reply(requestor, property);
+                Vec::new()
+            },
+            ClipboardReply::Targets => {
+                match reply_outcome(property, incr, || self.read_reply(requestor, property)) {
+                    ReplyOutcome::Incremental => self.clip_incr_receive.push(IncrReceive {
+                        window: requestor,
+                        property,
+                        data: Vec::new(),
+                        target: IncrTarget::Targets(clipboard),
+                    }),
+                    ReplyOutcome::Data(data) => self.populate_targets(clipboard, data),
+                    ReplyOutcome::Failed(err) => {
+                        self.get_clipboard_mut(clipboard).targets_request = None;
+                        debug!("No TARGETS for {clipboard:?}: {err}");
+                    },
+                }
+                Vec::new()
+            },
+            ClipboardReply::Fetch => {
+                match reply_outcome(property, incr, || self.read_reply(requestor, property)) {
+                    ReplyOutcome::Incremental => {
+                        self.clip_incr_receive.push(IncrReceive {
+                            window: requestor,
+                            property,
+                            data: Vec::new(),
+                            target: IncrTarget::Fetch(clipboard),
+                        });
+                        Vec::new()
+                    },
+                    ReplyOutcome::Data(data) => self.complete_clipboard_fetch(clipboard, Ok(data)),
+                    ReplyOutcome::Failed(err) => self.complete_clipboard_fetch(clipboard, Err(err)),
+                }
+            },
+        }
+    }
 
-        Some(finished)
+    /// Check if we are the ones receiving and there is some new value for the clipboard property.
+    /// Returns the fetches it completes.
+    #[must_use]
+    pub fn check_incr_receive_data(&mut self, xev: &XPropertyEvent) -> Vec<FinishedDataTransfer> {
+        let atom = xev.atom as xproto::Atom;
+        let xwindow = xev.window as xproto::Window;
+
+        // We only care about new values
+        if xev.state as u32 != xproto::Property::NEW_VALUE.into() {
+            return Vec::new();
+        }
+
+        let Some(index) = self
+            .clip_incr_receive
+            .iter()
+            .position(|receive| receive.window == xwindow && receive.property == atom)
+        else {
+            return Vec::new();
+        };
+
+        let Self { xconn, clip_incr_receive, .. } = self;
+        let result =
+            match xconn.get_dynamic_property(atom, xwindow, &mut clip_incr_receive[index].data) {
+                // A zero-length chunk ends the transfer.
+                Ok((_, 0)) => Ok(()),
+                Ok(_) => return Vec::new(),
+                Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err)),
+            };
+        let IncrReceive { data, target, .. } = self.clip_incr_receive.remove(index);
+        let result = result.map(|()| data);
+
+        match target {
+            IncrTarget::Targets(clipboard) => {
+                match result {
+                    Ok(data) => self.populate_targets(clipboard, data),
+                    Err(err) => {
+                        self.get_clipboard_mut(clipboard).targets_request = None;
+                        debug!("No TARGETS for {clipboard:?}: {err}");
+                    },
+                }
+                Vec::new()
+            },
+            IncrTarget::Fetch(clipboard) => self.complete_clipboard_fetch(clipboard, result),
+        }
+    }
+
+    /// Complete the first fetch of a clipboard, and request the conversion of the next one.
+    #[must_use]
+    fn complete_clipboard_fetch(
+        &mut self,
+        clipboard: ClipboardSelectionType,
+        result: io::Result<Vec<u8>>,
+    ) -> Vec<FinishedDataTransfer> {
+        let finished = self.get_clipboard_mut(clipboard).fetches.complete_front(result);
+        let mut finished: Vec<_> = finished.into_iter().collect();
+        finished.extend(self.start_clipboard_fetch(clipboard));
+        finished
+    }
+
+    /// Request the conversion of the first fetch of a clipboard, unless it has one. Returns the
+    /// fetches whose conversion could not be requested.
+    #[must_use]
+    fn start_clipboard_fetch(
+        &mut self,
+        clipboard: ClipboardSelectionType,
+    ) -> Vec<FinishedDataTransfer> {
+        let mut busy = self.busy_properties();
+        let Self { xconn, clipboards, properties, selection_window, .. } = self;
+        let selection = clipboard.selection_atom(xconn.atoms());
+        clipboards[clipboard as usize].fetches.start_front(|ty| {
+            request_conversion(
+                xconn,
+                properties,
+                &mut busy,
+                *selection_window,
+                selection,
+                ty.atom(),
+            )
+        })
+    }
+
+    /// The selection changed hands: abandon its fetches, and forget its types, which the
+    /// transfer id that named them no longer identifies.
+    #[must_use]
+    fn abandon_clipboard(
+        &mut self,
+        clipboard: ClipboardSelectionType,
+        why: &str,
+    ) -> Vec<FinishedDataTransfer> {
+        let state = self.get_clipboard_mut(clipboard);
+        state.transfer_serial = generate_transfer_id();
+        state.types = Default::default();
+        state.targets_request = None;
+        let abandoned = state.fetches.abandon_while(|_| true, why);
+        self.drop_orphan_receives();
+        abandoned
     }
 
     /// Check if we are the ones sending and the receiver deleted their property for the clipboard
@@ -1116,7 +1505,7 @@ impl DataTransferState {
     }
 
     /// From the TARGETS request, populate the relevant clipboard
-    pub fn populate_targets(&mut self, selection: xproto::Atom, data: Vec<u8>) {
+    fn populate_targets(&mut self, clipboard: ClipboardSelectionType, data: Vec<u8>) {
         let targets_bytes = data.chunks_exact(size_of::<xproto::Atom>());
         if !targets_bytes.remainder().is_empty() {
             warn!("Trailing bytes in list of targets from X11");
@@ -1127,49 +1516,87 @@ impl DataTransferState {
             .filter(|ty| ty.hint.is_some())
             .collect();
 
-        let Some(clipboard) = ClipboardSelectionType::from_atom(self.xconn.atoms(), selection)
-        else {
-            warn!("Got TARGETS for an unknown selection {}", self.xconn.atom_str(selection));
-            return;
-        };
-
         trace!(
             "Received available targets {:?} for clipboard {clipboard:?}",
             targets.iter().map(|t| self.xconn.atom_str(t.atom())).collect::<Vec<_>>()
         );
 
-        self.get_clipboard_mut(clipboard).types = targets.into();
+        let state = self.get_clipboard_mut(clipboard);
+        state.targets_request = None;
+        state.types = targets.into();
     }
 
-    pub fn request_updated_targets(&mut self, clipboard: ClipboardSelectionType, serial: u64) {
-        let clipboard_state = self.get_clipboard_mut(clipboard);
+    /// Handle an XFixes selection event: the owner of a selection changed. Returns the fetches
+    /// that the change abandons.
+    #[must_use]
+    pub fn selection_owner_changed(
+        &mut self,
+        clipboard: ClipboardSelectionType,
+        change: OwnerChange,
+        serial: u64,
+    ) -> Vec<FinishedDataTransfer> {
+        let state = self.get_clipboard_mut(clipboard);
+        match change {
+            OwnerChange::Ours => {
+                // `set_clipboard` minted the transfer id of the new contents: the fetches of the
+                // previous contents are abandoned, which spares them from waiting on an owner that
+                // may never answer them.
+                let current = state.transfer_serial;
+                let mut abandoned = state
+                    .fetches
+                    .abandon_while(|fetch| fetch.id != current, "the selection changed hands");
+                self.drop_orphan_receives();
+                abandoned.extend(self.start_clipboard_fetch(clipboard));
+                abandoned
+            },
+            // While we own the selection, only a `SelectionClear` takes it from us: this event
+            // was generated before we took it.
+            OwnerChange::Theirs | OwnerChange::Gone if state.owned_data.is_some() => Vec::new(),
+            OwnerChange::Theirs => {
+                // Sometimes you get duplicate update events. Skip these.
+                if serial == state.x11_serial {
+                    return Vec::new();
+                }
+                state.x11_serial = serial;
 
-        // Sometimes you get duplicate update events. Skip these.
-        if serial == clipboard_state.x11_serial {
-            return;
+                let abandoned = self.abandon_clipboard(clipboard, "the selection changed hands");
+                if let Err(e) = self.request_targets(clipboard) {
+                    error!("Unable to request TARGETS for {clipboard:?}: {e}")
+                }
+                abandoned
+            },
+            OwnerChange::Gone => self.abandon_clipboard(clipboard, "the selection owner went away"),
         }
+    }
 
-        clipboard_state.transfer_serial = generate_transfer_id();
-        clipboard_state.x11_serial = serial;
-
-        // If we own the clipboard, there is nothing to do
-        if clipboard_state.owned_data.is_some() {
-            return;
+    /// Handle a `SelectionClear`: another client took a selection we owned. Returns the
+    /// fetches that the change abandons.
+    #[must_use]
+    pub fn selection_cleared(
+        &mut self,
+        clipboard: ClipboardSelectionType,
+    ) -> Vec<FinishedDataTransfer> {
+        if self.get_clipboard_mut(clipboard).owned_data.take().is_some() {
+            trace!("Cleared owned data for {clipboard:?}")
         }
-
-        self.clear_clipboard(clipboard);
-
-        if let Err(e) = self.request_targets(clipboard) {
-            error!("Unable to request TARGETS for {clipboard:?}: {e}")
-        }
+        self.clip_incr_send.retain(|send| send.clipboard != clipboard);
+        self.abandon_clipboard(clipboard, "the selection changed hands")
     }
 
     /// Request the list of types on offer in a selection.
-    fn request_targets(&self, clipboard: ClipboardSelectionType) -> Result<(), X11Error> {
+    fn request_targets(&mut self, clipboard: ClipboardSelectionType) -> Result<(), X11Error> {
+        let mut busy = self.busy_properties();
         let atoms = self.xconn.atoms();
-        let selection = clipboard.selection_atom(atoms);
-        let property = clipboard.property_atom(atoms);
-        self.xconn.convert_selection(self.selection_window, selection, atoms[TARGETS], property)
+        let request = request_conversion(
+            &self.xconn,
+            &mut self.properties,
+            &mut busy,
+            self.selection_window,
+            clipboard.selection_atom(atoms),
+            atoms[TARGETS],
+        )?;
+        self.get_clipboard_mut(clipboard).targets_request = Some(request);
+        Ok(())
     }
 
     pub fn request_clipboard_read(&mut self, clipboard: ClipboardSelectionType) -> DataTransferId {
@@ -1188,7 +1615,10 @@ impl DataTransferState {
         send_data: Box<dyn DataTransferSend>,
         clipboard: ClipboardSelectionType,
     ) {
-        self.get_clipboard_mut(clipboard).owned_data = Some(send_data);
+        let state = self.get_clipboard_mut(clipboard);
+        // The contents change: the transfer id of the previous ones no longer names them.
+        state.transfer_serial = generate_transfer_id();
+        state.owned_data = Some(send_data);
         self.xconn.set_selection_owner(
             self.selection_window,
             clipboard.selection_atom(self.xconn.atoms()),
@@ -1250,31 +1680,30 @@ impl DataTransferState {
             })
             .ok_or(TransferError::Failed)?;
 
-        let serial = AsyncRequestSerial::get();
-        let should_emit_convert_selection =
-            self.get_clipboard_mut(clipboard).add_to_fetch(PendingFetch { serial, ty, window });
+        // The first fetch's conversion is requested now, so that a failure to request it is
+        // returned rather than delivered. A later fetch waits for the ones before it.
+        let request = if self.get_clipboard(clipboard).fetches.is_empty() {
+            let mut busy = self.busy_properties();
+            let selection = clipboard.selection_atom(self.xconn.atoms());
+            let request = request_conversion(
+                &self.xconn,
+                &mut self.properties,
+                &mut busy,
+                self.selection_window,
+                selection,
+                ty.atom(),
+            )
+            .map_err(|err| os_error!(format!("could not convert the selection: {err}")))?;
+            Some(request)
+        } else {
+            None
+        };
 
-        if should_emit_convert_selection {
-            self.do_next_clipboard_fetch(clipboard);
-        }
+        let state = self.get_clipboard_mut(clipboard);
+        let serial = AsyncRequestSerial::get();
+        state.fetches.push(PendingFetch { id: state.transfer_serial, serial, ty, window, request });
 
         Ok(serial)
-    }
-
-    /// Remove all pending fetches, INCR, and owned data for a clipboard
-    pub fn clear_clipboard(&mut self, clipboard: ClipboardSelectionType) {
-        let clipboard_state = self.get_clipboard_mut(clipboard);
-        if !clipboard_state.pending_fetch_types.is_empty() {
-            trace!("Clearing all pending fetch types for {clipboard:?}");
-            clipboard_state.pending_fetch_types.clear();
-        }
-
-        clipboard_state.types = Default::default();
-        if clipboard_state.owned_data.take().is_some() {
-            trace!("Cleared owned data for {clipboard:?}")
-        }
-        self.clip_incr_receive.retain(|receive| receive.clipboard != clipboard);
-        self.clip_incr_send.retain(|receive| receive.clipboard != clipboard);
     }
 }
 

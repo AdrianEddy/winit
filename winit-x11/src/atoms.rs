@@ -144,12 +144,7 @@ atom_manager! {
     // Stylus Atoms
     ABS_PRESSURE: b"Abs Pressure",
     ABS_TILT_X: b"Abs Tilt X",
-    ABS_TILT_Y: b"Abs Tilt Y",
-
-    // Atoms for reading selection targets (to avoid conflicts with other properties)
-    WINIT_TARGETS_PRIMARY,
-    WINIT_TARGETS_SECONDARY,
-    WINIT_TARGETS_CLIPBOARD
+    ABS_TILT_Y: b"Abs Tilt Y"
 }
 
 impl Index<AtomName> for Atoms {
