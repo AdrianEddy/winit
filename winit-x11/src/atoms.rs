@@ -45,6 +45,8 @@ atom_manager! {
     XIM_SERVERS,
     TARGETS,
     TIMESTAMP,
+    MULTIPLE,
+    ATOM_PAIR,
     CLIPBOARD,
     INCR,
 

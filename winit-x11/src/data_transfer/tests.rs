@@ -15,12 +15,14 @@ const STRING_ATOM: xproto::Atom = 104;
 const TEXT_PLAIN_ATOM: xproto::Atom = 105;
 const TEXT_PLAIN_UTF8_ATOM: xproto::Atom = 106;
 const IMAGE_PNG_ATOM: xproto::Atom = 107;
+const MULTIPLE_ATOM: xproto::Atom = 108;
 
 /// The atoms the tests use, each with its own value; every other atom is 0, which no test uses.
 fn atoms() -> Atoms {
     Atoms {
         TARGETS: TARGETS_ATOM,
         TIMESTAMP: TIMESTAMP_ATOM,
+        MULTIPLE: MULTIPLE_ATOM,
         UTF8_STRING: UTF8_STRING_ATOM,
         STRING: STRING_ATOM,
         TextPlain: TEXT_PLAIN_ATOM,
@@ -97,13 +99,13 @@ fn a_conversion_to_a_type_that_is_not_offered_is_refused() {
 }
 
 #[test]
-fn targets_lists_timestamp_targets_and_the_offered_types() {
+fn targets_lists_the_required_targets_and_the_offered_types() {
     let state = owned_text("hello");
 
     let ReplyPlan::Targets(targets) = state.plan_conversion(&atoms(), TARGETS_ATOM, 1024) else {
         panic!("TARGETS should be answered with a list of targets");
     };
-    assert_eq!(&targets[..2], &[TIMESTAMP_ATOM, TARGETS_ATOM]);
+    assert_eq!(&targets[..3], &[TIMESTAMP_ATOM, TARGETS_ATOM, MULTIPLE_ATOM]);
     for text in [STRING_ATOM, UTF8_STRING_ATOM, TEXT_PLAIN_ATOM, TEXT_PLAIN_UTF8_ATOM] {
         assert!(targets.contains(&text), "plain text target {text} is advertised");
     }
@@ -130,4 +132,61 @@ fn small_data_is_stored_directly_and_large_data_incrementally() {
         state.plan_conversion(&atoms(), UTF8_STRING_ATOM, 5),
         ReplyPlan::Incr(utf8, b"hello".to_vec())
     );
+}
+
+#[test]
+fn multiple_converts_its_pairs_in_order() {
+    let mut converted = Vec::new();
+    let failed = answer_multiple(&[UTF8_STRING_ATOM, 1, STRING_ATOM, 2], MULTIPLE_ATOM, |t, p| {
+        converted.push((t, p));
+        true
+    });
+
+    assert_eq!(converted, [(UTF8_STRING_ATOM, 1), (STRING_ATOM, 2)]);
+    assert_eq!(failed, None, "nothing is rewritten when every conversion succeeds");
+}
+
+#[test]
+fn multiple_reports_a_failed_conversion_with_property_none() {
+    let failed = answer_multiple(
+        &[UTF8_STRING_ATOM, 1, IMAGE_PNG_ATOM, 2, STRING_ATOM, 3],
+        MULTIPLE_ATOM,
+        |target, _| target != IMAGE_PNG_ATOM,
+    );
+
+    assert_eq!(
+        failed,
+        Some(vec![UTF8_STRING_ATOM, 1, IMAGE_PNG_ATOM, x11rb::NONE, STRING_ATOM, 3])
+    );
+}
+
+#[test]
+fn multiple_fails_pairs_without_property_and_nested_multiple() {
+    let mut converted = Vec::new();
+    let failed = answer_multiple(
+        &[UTF8_STRING_ATOM, x11rb::NONE, MULTIPLE_ATOM, 2, STRING_ATOM, 3],
+        MULTIPLE_ATOM,
+        |t, p| {
+            converted.push((t, p));
+            true
+        },
+    );
+
+    assert_eq!(converted, [(STRING_ATOM, 3)]);
+    assert_eq!(
+        failed,
+        Some(vec![UTF8_STRING_ATOM, x11rb::NONE, MULTIPLE_ATOM, x11rb::NONE, STRING_ATOM, 3])
+    );
+}
+
+#[test]
+fn multiple_ignores_a_trailing_unpaired_atom() {
+    let mut converted = Vec::new();
+    let failed = answer_multiple(&[UTF8_STRING_ATOM, 1, STRING_ATOM], MULTIPLE_ATOM, |t, p| {
+        converted.push((t, p));
+        false
+    });
+
+    assert_eq!(converted, [(UTF8_STRING_ATOM, 1)]);
+    assert_eq!(failed, Some(vec![UTF8_STRING_ATOM, x11rb::NONE]));
 }
