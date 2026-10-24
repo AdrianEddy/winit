@@ -354,13 +354,57 @@ pub(crate) struct PendingFetch {
     window: WindowId,
     /// The conversion of the fetch, once requested; only the first fetch of a queue has one.
     request: Option<Request>,
+    /// Whether the data is text in ISO Latin-1, the encoding of the `STRING` target (ICCCM),
+    /// which is converted to the UTF-8 of [`TypeHint::Plaintext`].
+    latin1: bool,
 }
 
 impl PendingFetch {
     fn finish(self, result: io::Result<Vec<u8>>) -> FinishedDataTransfer {
+        let result = if self.latin1 { result.map(|data| latin1_to_utf8(&data)) } else { result };
         let value = Arc::new(SelectionReader { type_: self.ty, result: result.map_err(Arc::new) });
         FinishedDataTransfer { id: self.id, serial: self.serial, value, window: self.window }
     }
+}
+
+/// ISO Latin-1 text, the encoding of the `STRING` target (ICCCM), as UTF-8.
+pub(crate) fn latin1_to_utf8(latin1: &[u8]) -> Vec<u8> {
+    latin1.iter().map(|&byte| char::from(byte)).collect::<String>().into_bytes()
+}
+
+/// Text as ISO Latin-1, the encoding of the `STRING` target (ICCCM), with `?` for the characters
+/// that Latin-1 cannot represent.
+pub(crate) fn utf8_to_latin1(text: &str) -> Vec<u8> {
+    text.chars().map(|char| u8::try_from(char).unwrap_or(b'?')).collect()
+}
+
+/// The type to read for `hint` among `types`, the types on offer: the first one with that hint,
+/// except that plain text is read from the UTF-8 targets rather than from `text/plain`, and from
+/// `text/plain` rather than from `STRING` (ICCCM: ISO Latin-1), whatever the order they are
+/// offered in.
+pub(crate) fn preferred_type<'a>(
+    types: &'a [SelectionType],
+    hint: TypeHint,
+    atoms: &Atoms,
+) -> Option<&'a SelectionType> {
+    most_preferred(types.iter().filter(|ty| ty.hint() == Some(hint)), hint, atoms)
+}
+
+/// The type to read for `hint` among `candidates`, types offered for it, as [`preferred_type`]
+/// chooses.
+fn most_preferred<'a>(
+    candidates: impl Iterator<Item = &'a SelectionType>,
+    hint: TypeHint,
+    atoms: &Atoms,
+) -> Option<&'a SelectionType> {
+    let text = [atoms[UTF8_STRING], atoms[TextPlainCharsetUtf8], atoms[TextPlain], atoms[STRING]];
+    let rank = |ty: &SelectionType| match hint {
+        TypeHint::Plaintext => {
+            text.iter().position(|&atom| atom == ty.atom()).unwrap_or(text.len())
+        },
+        _ => 0,
+    };
+    candidates.min_by_key(|ty| rank(ty))
 }
 
 /// The fetches of one selection, completed in the order they were requested: only the first one
@@ -736,15 +780,18 @@ impl ClipboardState {
     }
 
     /// Queue a fetch of `ty` from the current contents, to be delivered to `window`, with the
-    /// conversion `request` if it was already requested.
+    /// conversion `request` if it was already requested. `latin1` tells whether the data is text
+    /// in ISO Latin-1.
     pub(crate) fn enqueue_fetch(
         &mut self,
         ty: SelectionType,
         window: WindowId,
         request: Option<Request>,
+        latin1: bool,
     ) -> AsyncRequestSerial {
         let serial = AsyncRequestSerial::get();
-        self.fetches.push(PendingFetch { id: self.transfer_serial, serial, ty, window, request });
+        let id = self.transfer_serial;
+        self.fetches.push(PendingFetch { id, serial, ty, window, request, latin1 });
         serial
     }
 
@@ -790,24 +837,21 @@ impl ClipboardState {
         self.fetches.abandon_while(|_| true, why)
     }
 
-    /// From the list of types available on the clipboard, find the first available type that
-    /// matches the hint.
+    /// The type to read for `hint` among the types available on the clipboard, as
+    /// [`preferred_type`] chooses, whether the contents are ours or another client's.
     pub fn find_type_by_hint(&self, hint: TypeHint, atoms: &Atoms) -> Option<SelectionType> {
         if let Some(owned_data) = &self.owned_data {
-            let mut result = None;
+            // The targets that our types matching `hint` are offered under.
+            let mut offered = Vec::new();
             owned_data.for_each_available_type(&mut |ty| {
                 if ty.matches(&hint) {
-                    result = SelectionType::from_dyn(atoms, ty).next();
+                    offered.extend(SelectionType::from_dyn(atoms, ty));
                 }
-                if result.is_some() {
-                    core::ops::ControlFlow::Break(())
-                } else {
-                    core::ops::ControlFlow::Continue(())
-                }
+                core::ops::ControlFlow::Continue(())
             });
-            result
+            most_preferred(offered.iter(), hint, atoms).cloned()
         } else {
-            self.types.iter().find(|haystack| haystack.hint() == Some(hint)).cloned()
+            preferred_type(&self.types, hint, atoms).cloned()
         }
     }
 
@@ -844,6 +888,12 @@ impl ClipboardState {
             let ty = SelectionType::new(atoms, target);
             let data = match owned_data.data_for_type(&ty) {
                 Some(SendData::Uris(strings)) => encode_uri_list(strings),
+                // ICCCM: `STRING` is ISO Latin-1.
+                Some(SendData::String(str)) if target == atoms[STRING] => utf8_to_latin1(&str),
+                // Plain text is UTF-8; bytes that are not are read lossily.
+                Some(SendData::Bytes(text)) if target == atoms[STRING] => {
+                    utf8_to_latin1(&String::from_utf8_lossy(&text))
+                },
                 Some(SendData::String(str)) => str.into_bytes(),
                 Some(SendData::Bytes(binary)) => binary,
                 Some(send_data) => {
@@ -993,11 +1043,12 @@ impl SelectionType {
         [
             // Files
             (atoms[TextUriList], TypeHint::UriList),
-            // Plaintext
-            (atoms[STRING], TypeHint::Plaintext),
+            // Plaintext, in the order it is read in (`preferred_type`): our `TARGETS` list them in
+            // this order, so that a requestor taking the first text target gets UTF-8.
             (atoms[UTF8_STRING], TypeHint::Plaintext),
-            (atoms[TextPlain], TypeHint::Plaintext),
             (atoms[TextPlainCharsetUtf8], TypeHint::Plaintext),
+            (atoms[TextPlain], TypeHint::Plaintext),
+            (atoms[STRING], TypeHint::Plaintext),
             // HTML
             (atoms[TextHtml], TypeHint::Html),
             (atoms[TextHtmlCharsetUtf8], TypeHint::Html),
@@ -1177,7 +1228,7 @@ impl DataTransferState {
     }
 
     pub fn find_type_by_hint(&self, hint: TypeHint) -> Option<&SelectionType> {
-        self.state.as_ref()?.types.iter().find(|haystack| haystack.hint() == Some(hint))
+        preferred_type(&self.state.as_ref()?.types, hint, self.xconn.atoms())
     }
 
     pub fn init_state(
@@ -1839,7 +1890,9 @@ impl DataTransferState {
         };
         let serial = AsyncRequestSerial::get();
         let window = crate::event_loop::mkwid(state.target_window);
-        state.fetches.push(PendingFetch { id: state.transfer_id, serial, ty, window, request });
+        let latin1 = ty.atom() == self.xconn.atoms()[STRING];
+        let id = state.transfer_id;
+        state.fetches.push(PendingFetch { id, serial, ty, window, request, latin1 });
 
         Ok(serial)
     }
@@ -1950,7 +2003,8 @@ impl DataTransferState {
             None
         };
 
-        Ok(self.get_clipboard_mut(clipboard).enqueue_fetch(ty, window, request))
+        let latin1 = ty.atom() == self.xconn.atoms()[STRING];
+        Ok(self.get_clipboard_mut(clipboard).enqueue_fetch(ty, window, request, latin1))
     }
 }
 

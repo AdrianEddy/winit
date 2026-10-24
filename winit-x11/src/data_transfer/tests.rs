@@ -242,6 +242,7 @@ fn pending(id: DataTransferId, window: u64, request: Option<Request>) -> Pending
         ty: utf8(),
         window: WindowId::from_raw(window as _),
         request,
+        latin1: false,
     }
 }
 
@@ -528,10 +529,10 @@ fn a_fetch_keeps_the_window_and_the_transfer_it_was_requested_for() {
         ClipboardState { transfer_serial: DataTransferId::from_raw(1), ..owned_text("a") };
     let (window_a, window_b) = (WindowId::from_raw(1), WindowId::from_raw(2));
 
-    let first = state.enqueue_fetch(utf8(), window_a, Some(request(1, 10)));
+    let first = state.enqueue_fetch(utf8(), window_a, Some(request(1, 10)), false);
     // The contents change before the first fetch completes.
     state.transfer_serial = DataTransferId::from_raw(2);
-    let second = state.enqueue_fetch(utf8(), window_b, None);
+    let second = state.enqueue_fetch(utf8(), window_b, None, false);
 
     let finished = state.fetches.complete_front(Ok(b"a".to_vec())).expect("a fetch is pending");
     assert_eq!(
@@ -571,10 +572,10 @@ fn a_repeated_owner_change_is_skipped() {
 fn new_contents_of_ours_abandon_only_the_fetches_of_the_contents_they_replace() {
     let mut state =
         ClipboardState { transfer_serial: DataTransferId::from_raw(1), ..owned_text("a") };
-    state.enqueue_fetch(utf8(), WindowId::from_raw(1), Some(request(1, 10)));
+    state.enqueue_fetch(utf8(), WindowId::from_raw(1), Some(request(1, 10)), false);
     // `set_clipboard` mints the transfer id of the new contents.
     state.transfer_serial = DataTransferId::from_raw(2);
-    let kept = state.enqueue_fetch(utf8(), WindowId::from_raw(1), None);
+    let kept = state.enqueue_fetch(utf8(), WindowId::from_raw(1), None, false);
 
     assert_eq!(state.owner_change_action(OwnerChange::Ours, 9), OwnerChangeAction::AbandonPrevious);
     let abandoned = state.abandon_previous_fetches();
@@ -592,7 +593,7 @@ fn abandoning_a_selection_forgets_its_types_and_mints_a_new_transfer_id() {
         ..ClipboardState::default()
     };
     let previous = state.transfer_serial;
-    state.enqueue_fetch(utf8(), WindowId::from_raw(1), Some(request(1, 10)));
+    state.enqueue_fetch(utf8(), WindowId::from_raw(1), Some(request(1, 10)), false);
 
     let abandoned = state.abandon_all("the owner went away");
 
@@ -759,4 +760,144 @@ fn a_fetch_requested_while_the_last_fetch_is_delivered_keeps_the_drop_open() {
     });
 
     assert_eq!(settled, None);
+}
+
+fn text_type(atom: xproto::Atom) -> SelectionType {
+    SelectionType { hint: Some(TypeHint::Plaintext), atom }
+}
+
+#[test]
+fn plain_text_is_read_from_a_utf8_target_whatever_the_order_of_the_offer() {
+    let atoms = atoms();
+    let offer = |types: &[xproto::Atom]| types.iter().copied().map(text_type).collect::<Vec<_>>();
+    let read = |types: &[SelectionType]| {
+        preferred_type(types, TypeHint::Plaintext, &atoms).map(SelectionType::atom)
+    };
+
+    let all = offer(&[STRING_ATOM, TEXT_PLAIN_ATOM, TEXT_PLAIN_UTF8_ATOM, UTF8_STRING_ATOM]);
+    assert_eq!(read(&all), Some(UTF8_STRING_ATOM));
+    let utf8_text = Some(TEXT_PLAIN_UTF8_ATOM);
+    assert_eq!(read(&offer(&[STRING_ATOM, TEXT_PLAIN_ATOM, TEXT_PLAIN_UTF8_ATOM])), utf8_text);
+    assert_eq!(read(&offer(&[STRING_ATOM, TEXT_PLAIN_ATOM])), Some(TEXT_PLAIN_ATOM));
+    assert_eq!(read(&offer(&[STRING_ATOM])), Some(STRING_ATOM));
+    assert_eq!(read(&[]), None);
+}
+
+#[test]
+fn other_types_are_read_from_the_first_one_offered() {
+    let atoms = atoms();
+    let png =
+        SelectionType { hint: Some(TypeHint::Image { extension_hint: Some("png") }), atom: 1 };
+    let other = SelectionType { atom: 2, ..png.clone() };
+
+    let read = preferred_type(&[png, other], png_hint(), &atoms).map(SelectionType::atom);
+
+    assert_eq!(read, Some(1));
+}
+
+fn png_hint() -> TypeHint {
+    TypeHint::Image { extension_hint: Some("png") }
+}
+
+#[test]
+fn our_plain_text_is_read_from_a_utf8_target_whatever_the_order_of_our_types() {
+    let atoms = atoms();
+    let read = |state: ClipboardState| {
+        state.find_type_by_hint(TypeHint::Plaintext, &atoms).map(|ty| ty.atom())
+    };
+
+    assert_eq!(read(owned_text("text")), Some(UTF8_STRING_ATOM));
+
+    // Contents offered under targets of their own, `STRING` first.
+    let send = DataTransferSendBuilder::new(())
+        .with_type(text_type(STRING_ATOM), |_, _| Some(String::from("text")))
+        .with_type(text_type(UTF8_STRING_ATOM), |_, _| Some(String::from("text")))
+        .build();
+    let state = ClipboardState { owned_data: Some(send), ..Default::default() };
+    assert_eq!(read(state), Some(UTF8_STRING_ATOM));
+}
+
+#[test]
+fn our_targets_list_utf8_text_before_string() {
+    let ReplyPlan::Targets(targets) =
+        owned_text("text").plan_conversion(&atoms(), TARGETS_ATOM, 1024)
+    else {
+        panic!("TARGETS should be answered with a list of targets");
+    };
+    let text = [UTF8_STRING_ATOM, TEXT_PLAIN_UTF8_ATOM, TEXT_PLAIN_ATOM, STRING_ATOM];
+
+    let listed: Vec<_> = targets.into_iter().filter(|target| text.contains(target)).collect();
+    assert_eq!(listed, text);
+}
+
+#[test]
+fn our_plain_text_is_pasted_back_unchanged() {
+    let text = "zażółć — €5";
+    let state = owned_text(text);
+    let atoms = atoms();
+
+    // What a paste of our own clipboard does: pick the type, convert, receive.
+    let ty = state.find_type_by_hint(TypeHint::Plaintext, &atoms).expect("text is offered");
+    let ReplyPlan::Direct(_, data) = state.plan_conversion(&atoms, ty.atom(), 1024) else {
+        panic!("{ty:?} should be stored directly");
+    };
+    let mut queue = FetchQueue::default();
+    queue.push(PendingFetch {
+        latin1: ty.atom() == STRING_ATOM,
+        ..pending(DataTransferId::from_raw(1), 1, Some(request(1, 10)))
+    });
+    let finished = queue.complete_front(Ok(data)).expect("a fetch is pending");
+
+    assert_eq!(finished.value.try_as_string().ok().as_deref(), Some(text));
+}
+
+#[test]
+fn plain_text_given_as_bytes_is_answered_in_latin1_for_string() {
+    let atoms = atoms();
+    let answer = |bytes: &'static [u8], target| {
+        let send = DataTransferSendBuilder::new(())
+            .with_type(TypeHint::Plaintext, move |_, _| Some(bytes.to_vec()))
+            .build();
+        let state = ClipboardState { owned_data: Some(send), ..Default::default() };
+        match state.plan_conversion(&atoms, target, 1024) {
+            ReplyPlan::Direct(_, data) => data,
+            plan => panic!("{plan:?}"),
+        }
+    };
+
+    assert_eq!(answer("café ☃".as_bytes(), STRING_ATOM), b"caf\xe9 ?");
+    // Bytes that are not UTF-8 are read lossily.
+    assert_eq!(answer(b"caf\xe9", STRING_ATOM), b"caf?");
+    // The UTF-8 targets get the bytes as they are.
+    assert_eq!(answer("café ☃".as_bytes(), UTF8_STRING_ATOM), "café ☃".as_bytes());
+}
+
+#[test]
+fn text_received_from_string_is_converted_from_latin1() {
+    let mut queue = FetchQueue::default();
+    queue.push(PendingFetch {
+        latin1: true,
+        ..pending(DataTransferId::from_raw(1), 1, Some(request(1, 10)))
+    });
+
+    let finished = queue.complete_front(Ok(b"caf\xe9".to_vec())).expect("a fetch is pending");
+
+    assert_eq!(finished.value.try_as_string().ok().as_deref(), Some("café"));
+    assert_eq!(latin1_to_utf8(b"\xa9 2026"), "© 2026".as_bytes());
+}
+
+#[test]
+fn a_string_request_is_answered_in_latin1() {
+    let state = owned_text("café ☃");
+    let atoms = atoms();
+
+    let ReplyPlan::Direct(_, latin1) = state.plan_conversion(&atoms, STRING_ATOM, 1024) else {
+        panic!("STRING is offered with plain text");
+    };
+    assert_eq!(latin1, b"caf\xe9 ?");
+
+    let ReplyPlan::Direct(_, utf8) = state.plan_conversion(&atoms, UTF8_STRING_ATOM, 1024) else {
+        panic!("UTF8_STRING is offered with plain text");
+    };
+    assert_eq!(utf8, "café ☃".as_bytes());
 }
