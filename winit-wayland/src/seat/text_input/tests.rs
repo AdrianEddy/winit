@@ -53,3 +53,23 @@ fn a_commit_ends_a_shown_preedit_without_a_clear() {
     assert_eq!(done(&mut data), [Ime::Commit("x".to_owned())]);
     assert!(done(&mut data).is_empty(), "the commit left no preedit to clear");
 }
+
+/// `preedit_string(NULL, 0, 0)` — the protocol's reset, what an input method sends to clear its
+/// preedit — and an empty string with `(0, 0)` arrive as winit's "cleared" preedit, with no cursor,
+/// and leave nothing owed to the next empty `done`; a non-empty preedit keeps its cursor.
+#[test]
+fn an_empty_preedit_carries_no_cursor() {
+    for text in [None, Some(String::new())] {
+        let mut data =
+            TextInputDataInner { last_preedit_empty: false, ..TextInputDataInner::default() };
+        data.pending_preedit = Some(Preedit::from_event(text, 0, 0));
+        assert_eq!(done(&mut data), [Ime::Preedit(String::new(), None)]);
+        assert!(
+            done(&mut data).is_empty(),
+            "the reset was the clear: the next empty `done` owes none"
+        );
+    }
+    let mut data = TextInputDataInner::default();
+    data.pending_preedit = Some(Preedit::from_event(Some("ab".to_owned()), 0, 0));
+    assert_eq!(done(&mut data), [Ime::Preedit("ab".to_owned(), Some((0, 0)))]);
+}

@@ -104,15 +104,8 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 state.events_sink.push_window_event(WindowEvent::Ime(Ime::Disabled), window_id);
             },
             TextInputEvent::PreeditString { text, cursor_begin, cursor_end } => {
-                let text = text.unwrap_or_default();
-                let cursor_begin = usize::try_from(cursor_begin)
-                    .ok()
-                    .and_then(|idx| text.is_char_boundary(idx).then_some(idx));
-                let cursor_end = usize::try_from(cursor_end)
-                    .ok()
-                    .and_then(|idx| text.is_char_boundary(idx).then_some(idx));
-
-                text_input_data.pending_preedit = Some(Preedit { text, cursor_begin, cursor_end })
+                text_input_data.pending_preedit =
+                    Some(Preedit::from_event(text, cursor_begin, cursor_end))
             },
             TextInputEvent::CommitString { text } => {
                 text_input_data.pending_preedit = None;
@@ -261,7 +254,8 @@ impl TextInputDataInner {
         let preedit = self.pending_preedit.take().map(|preedit| {
             let cursor_range = preedit.cursor_begin.map(|b| (b, preedit.cursor_end.unwrap_or(b)));
 
-            self.last_preedit_empty = false;
+            // An empty preedit is a clear, so the next `done` with nothing pending sends none.
+            self.last_preedit_empty = preedit.text.is_empty();
             Ime::Preedit(preedit.text, cursor_range)
         });
 
@@ -275,6 +269,28 @@ struct Preedit {
     text: String,
     cursor_begin: Option<usize>,
     cursor_end: Option<usize>,
+}
+
+impl Preedit {
+    /// The pending preedit a `preedit_string` event sets. An empty preedit carries no cursor: the
+    /// protocol's reset, `preedit_string(NULL, 0, 0)`, which input methods send to clear the
+    /// preedit, reaches the application as `Ime::Preedit("", None)`, the clear the other backends
+    /// send, not as an empty preedit with a cursor at `(0, 0)`, which the Windows and X11 backends
+    /// send for a composition that is still open.
+    fn from_event(text: Option<String>, cursor_begin: i32, cursor_end: i32) -> Self {
+        let text = text.unwrap_or_default();
+        if text.is_empty() {
+            return Preedit { text, cursor_begin: None, cursor_end: None };
+        }
+        let cursor_begin = usize::try_from(cursor_begin)
+            .ok()
+            .and_then(|idx| text.is_char_boundary(idx).then_some(idx));
+        let cursor_end = usize::try_from(cursor_end)
+            .ok()
+            .and_then(|idx| text.is_char_boundary(idx).then_some(idx));
+
+        Preedit { text, cursor_begin, cursor_end }
+    }
 }
 
 /// The delete request
