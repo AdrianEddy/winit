@@ -7,6 +7,7 @@
 
 #[macro_use]
 mod util;
+mod clipboard_format;
 mod dark_mode;
 mod data_transfer;
 mod definitions;
@@ -35,6 +36,7 @@ use winit_core::event::DeviceId;
 use winit_core::icon::{BadIcon, Icon};
 use winit_core::window::{PlatformWindowAttributes, Window as CoreWindow};
 
+pub use self::clipboard_format::ClipboardFormat;
 pub use self::event_loop::{EventLoop, PlatformSpecificEventLoopAttributes};
 use self::icon::{RaiiIcon, SelectedCursor};
 pub use self::keyboard::{physicalkey_to_scancode, scancode_to_physicalkey};

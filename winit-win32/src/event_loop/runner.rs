@@ -37,8 +37,8 @@ pub(super) struct PendingDrag {
 }
 
 /// Set while `DoDragDrop` is on the call stack - i.e., this process is the source of an active
-/// drag. The target-side `IDropTarget` checks this to recognize self-drops and reuse the source's
-/// id + allowed actions instead of waiting for the (buffered) app `DragEntered` handler.
+/// drag. The target-side `IDropTarget` checks this to recognize self-drops, which get the
+/// source's id.
 #[derive(Copy, Clone)]
 pub(crate) struct SourceDrag {
     pub(crate) id: DataTransferId,
@@ -79,13 +79,13 @@ pub(crate) struct EventLoopRunner {
     /// handling those messages.
     pub(super) pending_drag: RefCell<Option<PendingDrag>>,
 
-    /// For self-drops, target-side `IDropTarget::Drop` can't release the cached `DragState`
-    /// before its `DragDropped` `WindowEvent` is delivered - the event is buffered (the outer app
-    /// handler holds `event_handler` for the duration of `DoDragDrop`) and `data_transfer(id)`
-    /// would fail with `TransferError::UnknownTransfer` if cleanup ran synchronously. So we stash
-    /// the id here and drain it at the end of `dispatch_buffered_events`, after the app's buffered
-    /// handler has had its chance to read the data.
-    pending_source_drag_cleanup: Cell<Option<DataTransferId>>,
+    /// A drop that came while a handler was running, from a modal loop inside it, has its
+    /// `DragDropped` `WindowEvent` buffered, and target-side `IDropTarget::Drop` can't release the
+    /// cached `DragState` before the event is delivered: `data_transfer(id)` would fail with
+    /// `TransferError::UnknownTransfer`. So we stash the id here and drain it at the end of
+    /// `dispatch_buffered_events`, after the app's buffered handler has had its chance to read
+    /// the data.
+    pending_drag_cleanup: Cell<Option<DataTransferId>>,
 
     panic_error: Cell<Option<PanicError>>,
 }
@@ -141,7 +141,7 @@ impl EventLoopRunner {
             windows: RefCell::new(Vec::new()),
             source_drag: Cell::new(None),
             pending_drag: RefCell::new(None),
-            pending_source_drag_cleanup: Cell::new(None),
+            pending_drag_cleanup: Cell::new(None),
         }
     }
 
@@ -153,10 +153,12 @@ impl EventLoopRunner {
         };
 
         // Make the drag visible to our own target-side `IDropTarget` so it can recognize
-        // self-drops and reuse this id + action mask without going through the (buffered) app
-        // handler. The guard ensures the flag is cleared on any exit path - if anything between
-        // here and `DoDragDrop`'s return panics, the stale flag would otherwise permanently
-        // disable `WM_PAINT` dispatch and misclassify all future external drags as self-drops.
+        // self-drops and give them this id. This runs after the application's handler has
+        // returned, so the target-side events of a self-drop are dispatched as they come, like
+        // those of any drop. The guard ensures the flag is cleared on any exit path - if anything
+        // between here and `DoDragDrop`'s return panics, the stale flag would otherwise
+        // permanently disable `WM_PAINT` dispatch and misclassify all future external drags
+        // as self-drops.
         struct ClearOnDrop<'a>(&'a Cell<Option<SourceDrag>>);
         impl Drop for ClearOnDrop<'_> {
             fn drop(&mut self) {
@@ -193,9 +195,10 @@ impl EventLoopRunner {
             return;
         }
 
-        // Both `DRAGDROP_S_DROP` and `DRAGDROP_S_CANCEL` are success codes for us - the app
-        // will hear about the outcome via the buffered `DragDropped`/`DragLeft` events
-        // (target-side translates `effect_out == DROPEFFECT_NONE` to `DragLeft`).
+        // Both `DRAGDROP_S_DROP` and `DRAGDROP_S_CANCEL` are success codes for us - for a
+        // self-drop, the app has heard about the outcome via the target-side
+        // `DragDropped`/`DragLeft` events (target-side translates `effect_out == DROPEFFECT_NONE`
+        // to `DragLeft`).
         // Log the negotiated effect so cross-process drops, which have no target-side event
         // in this process, leave a debuggable trace of what action the remote target performed.
         tracing::trace!(
@@ -204,8 +207,8 @@ impl EventLoopRunner {
         );
     }
 
-    pub(crate) fn defer_source_drag_cleanup(&self, id: DataTransferId) {
-        self.pending_source_drag_cleanup.set(Some(id));
+    pub(crate) fn defer_drag_cleanup(&self, id: DataTransferId) {
+        self.pending_drag_cleanup.set(Some(id));
     }
 
     pub(crate) fn data_transfer(&self) -> &DataTransferState {
@@ -282,7 +285,7 @@ impl EventLoopRunner {
             windows: _,
             source_drag,
             pending_drag,
-            pending_source_drag_cleanup,
+            pending_drag_cleanup,
         } = self;
         interrupt_msg_dispatch.set(false);
         runner_state.set(RunnerState::Uninitialized);
@@ -292,7 +295,7 @@ impl EventLoopRunner {
         data_transfer.reset();
         source_drag.set(None);
         pending_drag.take();
-        pending_source_drag_cleanup.set(None);
+        pending_drag_cleanup.set(None);
     }
 }
 
@@ -435,8 +438,8 @@ impl EventLoopRunner {
             }
         }
         // The app's buffered `DragDropped` handler (if any) has now had its chance to call
-        // `data_transfer(id)`; safe to release the cached `DragState` for a deferred self-drop.
-        if let Some(id) = self.pending_source_drag_cleanup.take() {
+        // `data_transfer(id)`; safe to release the cached `DragState` of a buffered drop.
+        if let Some(id) = self.pending_drag_cleanup.take() {
             self.data_transfer.remove_drag(id);
         }
     }

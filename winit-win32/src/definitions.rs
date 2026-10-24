@@ -13,6 +13,7 @@ pub type IAdviseSink = *mut c_void;
 pub type IDataObject = *mut c_void;
 pub type IEnumFORMATETC = *mut c_void;
 pub type IEnumSTATDATA = *mut c_void;
+pub type IStream = *mut c_void;
 
 #[repr(C)]
 pub struct IUnknownVtbl {
@@ -84,6 +85,30 @@ pub struct IEnumFORMATETCVtbl {
     pub Clone: unsafe extern "system" fn(
         This: *mut IEnumFORMATETC,
         ppenum: *mut *mut IEnumFORMATETC,
+    ) -> HRESULT,
+}
+
+/// The start of the `IStream` vtable: `IUnknown`, `ISequentialStream`, then `Seek`.
+#[repr(C)]
+pub struct IStreamVtbl {
+    pub parent: IUnknownVtbl,
+    pub Read: unsafe extern "system" fn(
+        This: *mut IStream,
+        pv: *mut c_void,
+        cb: u32,
+        pcbRead: *mut u32,
+    ) -> HRESULT,
+    pub Write: unsafe extern "system" fn(
+        This: *mut IStream,
+        pv: *const c_void,
+        cb: u32,
+        pcbWritten: *mut u32,
+    ) -> HRESULT,
+    pub Seek: unsafe extern "system" fn(
+        This: *mut IStream,
+        dlibMove: i64,
+        dwOrigin: u32,
+        plibNewPosition: *mut u64,
     ) -> HRESULT,
 }
 

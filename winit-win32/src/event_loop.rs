@@ -65,9 +65,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::BOOL;
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{CustomCursor, CustomCursorSource};
-use winit_core::data_transfer::{
-    DataTransfer, DataTransferId, DataTransferSend, TransferType, TypedData,
-};
+use winit_core::data_transfer::{DataTransfer, DataTransferId, DataTransferSend, TransferType};
 use winit_core::error::{
     CreateWindowError, CustomCursorError, EventLoopError, NotSupportedError, TransferError,
 };
@@ -90,8 +88,8 @@ use super::SelectedCursor;
 use super::window::set_skip_taskbar;
 use crate::dark_mode::try_theme;
 use crate::data_transfer::{
-    DropSource, FileDropHandler, SourceDataObject, WinDataTransfer, WinTypedData,
-    retry_while_clipboard_busy, wait_for_clipboard,
+    DropSource, FileDropHandler, SourceDataObject, WinDataTransfer, retry_while_clipboard_busy,
+    wait_for_clipboard,
 };
 use crate::dpi::{become_dpi_aware, dpi_to_scale_factor};
 use crate::event_loop::runner::PendingDrag;
@@ -532,37 +530,26 @@ impl RootActiveEventLoop for ActiveEventLoop {
         id: DataTransferId,
         type_: &dyn TransferType,
     ) -> Result<AsyncRequestSerial, TransferError> {
-        let (data, window_id) = match self.0.data_transfer().drag_state(id) {
-            Some(state) => (state.data.clone(), state.window_id),
-            None => {
-                let data = self.0.data_transfer().clipboard_data(id)?;
-                let window_id = self.0.clipboard_window().ok_or(TransferError::Failed)?;
-                (data, window_id)
-            },
+        let transfers = self.0.data_transfer();
+        let window_id = match transfers.transfer_window(id)? {
+            Some(window_id) => window_id,
+            None => self.0.clipboard_window().ok_or(TransferError::Failed)?,
         };
-        let hint = type_.hint().ok_or(TransferError::Failed)?;
-        let typed_data = WinTypedData::new(data, hint)
-            .map(|value| Arc::new(value) as Arc<dyn TypedData>)
-            .ok_or(TransferError::Failed)?;
+        let value = Arc::new(transfers.read(id, type_)?);
 
         let serial = AsyncRequestSerial::get();
 
         self.0.send_event(Event::Window {
             window_id,
-            event: WindowEvent::DataTransferReceived { id, serial, value: typed_data },
+            event: WindowEvent::DataTransferReceived { id, serial, value },
         });
 
         Ok(serial)
     }
 
     fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, TransferError> {
-        if let Some(state) = self.0.data_transfer().drag_state(id) {
-            return Ok(Box::new(WinDataTransfer::new(state.data.clone())));
-        }
-
-        let data = self.0.data_transfer().clipboard_data(id)?;
-
-        Ok(Box::new(WinDataTransfer::new(data)))
+        let formats = self.0.data_transfer().available_formats(id)?;
+        Ok(Box::new(WinDataTransfer::new(formats)))
     }
 
     fn clipboard(&self) -> Result<Option<DataTransferId>, TransferError> {

@@ -1,6 +1,5 @@
 use std::borrow::Cow;
-use std::cell::{Cell, Ref, RefCell};
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString, c_void};
 use std::num::NonZeroU32;
 use std::ops::{BitOr, ControlFlow};
@@ -17,14 +16,15 @@ use dpi::PhysicalPosition;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, percent_encode};
 use windows_sys::Win32::Foundation::{
     CLIPBRD_E_CANT_OPEN, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-    DV_E_FORMATETC, E_ABORT, E_FAIL, E_NOINTERFACE, E_NOTIMPL, E_UNEXPECTED, GlobalFree, HGLOBAL,
-    HWND, OLE_E_ADVISENOTSUPPORTED, OLE_E_WRONGCOMPOBJ, POINT, POINTL, RPC_E_CHANGED_MODE, S_FALSE,
-    S_OK,
+    DV_E_FORMATETC, E_ABORT, E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_UNEXPECTED,
+    GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, OLE_E_WRONGCOMPOBJ, POINT, POINTL,
+    RPC_E_CHANGED_MODE, S_FALSE, S_OK,
 };
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Com::{
-    DVASPECT_CONTENT, FORMATETC, STGMEDIUM, TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL,
-    TYMED_MFPICT,
+    CoTaskMemFree, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STREAM_SEEK_CUR,
+    STREAM_SEEK_SET, TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL, TYMED_ISTREAM,
+    TYMED_MFPICT, TYMED_NULL,
 };
 use windows_sys::Win32::System::DataExchange::{
     GetClipboardSequenceNumber, RegisterClipboardFormatW,
@@ -49,111 +49,362 @@ use winit_core::event::WindowEvent;
 use winit_core::event_loop::DndAction;
 use winit_core::window::WindowId;
 
+use crate::clipboard_format::{
+    AvailableFormat, BYTE_MEDIA, ClipboardFormat, FormatListing, KnownFormat, Payload, candidates,
+    decode, known_formats, readable_formats,
+};
 use crate::definitions::{
     IDataObject, IDataObjectVtbl, IDropSource, IDropSourceVtbl, IDropTarget, IDropTargetHelper,
     IDropTargetHelperVtbl, IDropTargetVtbl, IEnumFORMATETC, IEnumFORMATETCVtbl, IID_IDataObject,
-    IID_IDropSource, IID_IDropTargetHelper, IID_IEnumFORMATETC, IUnknown, IUnknownVtbl,
+    IID_IDropSource, IID_IDropTargetHelper, IID_IEnumFORMATETC, IStream, IStreamVtbl, IUnknown,
+    IUnknownVtbl,
 };
 use crate::event_loop::EventLoopRunner;
 use crate::util;
 
-// TODO: Exposing the full native API to client applications is too error-prone so long as
-// winit is still manually implementing refcounting and using the win32 APIs. For now, we
-// just eagerly read all the data supported by cross-platform type hints on Windows. This
-// would be resolved by migrating to `windows-rs`.
-#[derive(Debug, Default)]
-pub(crate) struct DataObject {
-    data: HashMap<TypeHint, SendData>,
-}
+/// An owned reference to a COM object: released on drop, and `AddRef`ed on clone.
+pub(crate) struct ComPtr<T>(NonNull<T>);
 
-impl DataObject {
-    unsafe fn from_idataobject(data_obj: *const IDataObject) -> Result<Self, HRESULT> {
-        let mut data = HashMap::new();
-
-        if let Some(text) = unsafe { read_unicode_text(data_obj) }? {
-            data.insert(TypeHint::Plaintext, SendData::String(text));
-        }
-
-        if let Some(uris) = unsafe { read_uri_list(data_obj) }? {
-            if !uris.is_empty() {
-                data.insert(TypeHint::UriList, SendData::Uris(uris));
-            }
-        }
-
-        if let Some(png) = unsafe { read_png(data_obj) }? {
-            if !png.is_empty() {
-                data.insert(TypeHint::Image { extension_hint: Some("png") }, SendData::Bytes(png));
-            }
-        }
-
-        Ok(Self { data })
+impl<T> ComPtr<T> {
+    /// Takes over the reference that `ptr` holds, or returns `None` if it is null.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be null, or point to a COM object of which the caller owns a reference.
+    unsafe fn from_raw(ptr: *mut T) -> Option<Self> {
+        NonNull::new(ptr).map(Self)
     }
 
-    fn resolve(&self, requested: TypeHint) -> Option<TypeHint> {
-        self.data.keys().copied().find(|stored| stored.matches(&requested))
+    /// Takes a new reference to the object behind `ptr`, or returns `None` if it is null.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be null, or point to a COM object.
+    pub(crate) unsafe fn from_borrowed(ptr: *mut T) -> Option<Self> {
+        let this = unsafe { Self::from_raw(ptr) }?;
+        unsafe { (this.vtbl::<IUnknownVtbl>().AddRef)(this.as_unknown()) };
+        Some(this)
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+
+    fn as_unknown(&self) -> *mut IUnknown {
+        self.0.as_ptr().cast()
+    }
+
+    /// The vtable of the object.
+    ///
+    /// # Safety
+    ///
+    /// The vtable of the object must start with a `V`.
+    unsafe fn vtbl<V>(&self) -> &V {
+        unsafe { &**self.0.as_ptr().cast::<*const V>() }
     }
 }
 
-/// RAII wrapper around an STGMEDIUM returned by IDataObject::GetData, releasing it on drop.
-struct StgMedium(STGMEDIUM);
+impl<T> Clone for ComPtr<T> {
+    fn clone(&self) -> Self {
+        unsafe { (self.vtbl::<IUnknownVtbl>().AddRef)(self.as_unknown()) };
+        Self(self.0)
+    }
+}
 
-impl StgMedium {
-    /// Returns `Ok(None)` if the object doesn't provide the format, and `Err` if the clipboard
-    /// could not be opened.
-    unsafe fn get(data_obj: *const IDataObject, cf_format: u16) -> Result<Option<Self>, HRESULT> {
-        let format = FORMATETC {
-            cfFormat: cf_format,
+impl<T> Drop for ComPtr<T> {
+    fn drop(&mut self) {
+        unsafe { (self.vtbl::<IUnknownVtbl>().Release)(self.as_unknown()) };
+    }
+}
+
+impl<T> fmt::Debug for ComPtr<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ComPtr").field(&self.0).finish()
+    }
+}
+
+/// Opens the data object of the current clipboard contents.
+fn open_clipboard() -> Result<ComPtr<IDataObject>, TransferError> {
+    ensure_ole_initialized().map_err(|err| os_error!(err))?;
+
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let hr =
+        retry_while_clipboard_busy(|| unsafe { OleGetClipboard(&mut ptr) }, wait_for_clipboard);
+    match unsafe { ComPtr::from_raw(ptr.cast()) } {
+        Some(data_object) if hr == S_OK => Ok(data_object),
+        _ => Err(os_error!(format!("OleGetClipboard failed: 0x{hr:08x}")).into()),
+    }
+}
+
+/// The most listings that are read from the format enumerator of a data object.
+const MAX_LISTINGS: usize = 4096;
+
+/// Lists the formats of `data_object` with `EnumFormatEtc`, or returns the result of the call
+/// that failed. A source that gives no enumerator, as one answering `OLE_S_USEREG` does, fails
+/// with that result.
+fn enumerate_listings(data_object: &ComPtr<IDataObject>) -> Result<Vec<FormatListing>, HRESULT> {
+    let enum_format_etc = unsafe { data_object.vtbl::<IDataObjectVtbl>() }.EnumFormatEtc;
+    let mut enumerator: *mut IEnumFORMATETC = std::ptr::null_mut();
+    let hr = retry_while_clipboard_busy(
+        || unsafe { enum_format_etc(data_object.as_ptr(), DATADIR_GET as u32, &mut enumerator) },
+        wait_for_clipboard,
+    );
+    if hr < 0 {
+        return Err(hr);
+    }
+    let enumerator = unsafe { ComPtr::from_raw(enumerator) }.ok_or(hr)?;
+    let next = unsafe { enumerator.vtbl::<IEnumFORMATETCVtbl>() }.Next;
+
+    let mut listings = Vec::new();
+    let mut batch = [FORMATETC::default(); 16];
+    while listings.len() < MAX_LISTINGS {
+        let mut fetched = 0;
+        let hr = unsafe {
+            next(enumerator.as_ptr(), batch.len() as u32, batch.as_mut_ptr(), &mut fetched)
+        };
+        if hr < 0 {
+            return Err(hr);
+        }
+        let fetched = &batch[..(fetched as usize).min(batch.len())];
+        for format in fetched {
+            // The enumerator allocates the target device of a listing for the caller to free.
+            if !format.ptd.is_null() {
+                unsafe { CoTaskMemFree(format.ptd.cast()) };
+            }
+        }
+        listings.extend(fetched.iter().map(|format| FormatListing {
+            id: format.cfFormat,
+            aspect: format.dwAspect,
+            index: format.lindex,
+            media: format.tymed,
+        }));
+        if hr != S_OK || fetched.is_empty() {
+            break;
+        }
+    }
+    listings.truncate(MAX_LISTINGS);
+    Ok(listings)
+}
+
+/// The formats that winit converts and that `data_object` says it can give, for a source that
+/// cannot list its formats.
+fn query_known_formats(data_object: &ComPtr<IDataObject>) -> Result<Vec<AvailableFormat>, HRESULT> {
+    let query_get_data = unsafe { data_object.vtbl::<IDataObjectVtbl>() }.QueryGetData;
+    let mut formats = Vec::new();
+    for format in known_formats() {
+        let query = FORMATETC {
+            cfFormat: format.id(),
             ptd: std::ptr::null_mut(),
             dwAspect: DVASPECT_CONTENT,
             lindex: -1,
-            tymed: TYMED_HGLOBAL as u32,
+            tymed: BYTE_MEDIA,
         };
-
-        let mut medium = unsafe { std::mem::zeroed::<STGMEDIUM>() };
-        let get_data = unsafe { (*(*data_obj).cast::<IDataObjectVtbl>()).GetData };
         let hr = retry_while_clipboard_busy(
-            || unsafe { get_data(data_obj as *mut _, &format, &mut medium) },
+            || unsafe { query_get_data(data_object.as_ptr(), &query) },
             wait_for_clipboard,
         );
         match hr {
-            CLIPBRD_E_CANT_OPEN => Err(CLIPBRD_E_CANT_OPEN),
-            hr if hr < 0 => Ok(None),
-            _ => Ok(Some(Self(medium))),
+            S_OK => formats.push(AvailableFormat { format, media: BYTE_MEDIA }),
+            hr if is_call_failure(hr) => return Err(hr),
+            // Any other answer is that the format is not offered.
+            _ => {},
+        }
+    }
+    Ok(formats)
+}
+
+/// Whether `hr`, the result of a call into a source, is a failure of the call rather than the
+/// source's answer: the clipboard held open by another application, or a failure of COM's
+/// channel to another process, such as a rejected call or a server that has gone.
+fn is_call_failure(hr: HRESULT) -> bool {
+    const FACILITY_RPC: u32 = 1;
+    const FACILITY_WIN32: u32 = 7;
+    // The Win32 errors of RPC, `RPC_S_*` and `RPC_X_*`.
+    const RPC_ERRORS: std::ops::Range<u32> = 1700..2000;
+    let (facility, code) = ((hr as u32 >> 16) & 0x1fff, hr as u32 & 0xffff);
+    hr == CLIPBRD_E_CANT_OPEN
+        || (hr < 0
+            && (facility == FACILITY_RPC
+                || (facility == FACILITY_WIN32 && RPC_ERRORS.contains(&code))))
+}
+
+/// The formats on offer in a data transfer, listed once and shared.
+type Formats = Arc<[AvailableFormat]>;
+
+/// Lists the formats that `data_object` offers and that can be read as bytes.
+///
+/// A source that cannot list its formats is asked for each format that winit converts instead.
+fn offered_formats(data_object: &ComPtr<IDataObject>) -> Result<Formats, TransferError> {
+    match enumerate_listings(data_object) {
+        Ok(listings) => Ok(readable_formats(&listings)
+            .into_iter()
+            .filter_map(|(id, media)| {
+                Some(AvailableFormat { format: ClipboardFormat::from_id(id)?, media })
+            })
+            .collect()),
+        // A source that cannot list its formats says so, or gives no enumerator.
+        Err(hr) if hr == E_NOTIMPL || hr >= 0 => match query_known_formats(data_object) {
+            Ok(formats) => Ok(formats.into()),
+            Err(hr) => Err(os_error!(format!("QueryGetData failed: 0x{hr:08x}")).into()),
+        },
+        // Any other failure, such as of COM's channel to the source, lists nothing, so that the
+        // formats are listed again when the transfer is used again.
+        Err(hr) => Err(os_error!(format!("EnumFormatEtc failed: 0x{hr:08x}")).into()),
+    }
+}
+
+/// Why a format could not be read.
+#[derive(Debug)]
+enum ReadError {
+    /// A call into the source failed.
+    Call { call: &'static str, hr: HRESULT },
+    /// The data is not valid data of the format.
+    Invalid,
+}
+
+impl From<ReadError> for TransferError {
+    fn from(err: ReadError) -> Self {
+        match err {
+            ReadError::Call { call, hr } => os_error!(format!("{call} failed: 0x{hr:08x}")).into(),
+            ReadError::Invalid => TransferError::Failed,
+        }
+    }
+}
+
+/// Gets format `id` of `data_object`, in one of the storage media `media`.
+fn get_medium(
+    data_object: &ComPtr<IDataObject>,
+    id: u16,
+    media: u32,
+) -> Result<OwnedStgMedium, ReadError> {
+    let format = FORMATETC {
+        cfFormat: id,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT,
+        lindex: -1,
+        tymed: media,
+    };
+    let get_data = unsafe { data_object.vtbl::<IDataObjectVtbl>() }.GetData;
+    let mut medium = unsafe { std::mem::zeroed::<STGMEDIUM>() };
+    let hr = retry_while_clipboard_busy(
+        || unsafe { get_data(data_object.as_ptr(), &format, &mut medium) },
+        wait_for_clipboard,
+    );
+    if hr < 0 {
+        return Err(ReadError::Call { call: "GetData", hr });
+    }
+    if medium.tymed == TYMED_ISTREAM as u32 && unsafe { medium.u.pstm }.is_null() {
+        // There is no stream to read, nor to release; `pUnkForRelease` is still released.
+        medium.tymed = TYMED_NULL as u32;
+    }
+    Ok(OwnedStgMedium(medium))
+}
+
+/// Reads one format of `data_object`, and decodes it.
+fn read_format(
+    data_object: &ComPtr<IDataObject>,
+    available: &AvailableFormat,
+) -> Result<Payload, ReadError> {
+    let format = &available.format;
+    let mut medium = get_medium(data_object, format.id(), available.media)?;
+    // A source that offers a stream may answer with an empty global memory object instead; its
+    // stream is read then, if it gives one.
+    if medium.0.tymed == TYMED_HGLOBAL as u32
+        && available.media & TYMED_ISTREAM as u32 != 0
+        && unsafe { GlobalSize(medium.0.u.hGlobal) } == 0
+    {
+        if let Some(stream) = get_medium(data_object, format.id(), TYMED_ISTREAM as u32)
+            .ok()
+            .filter(|stream| stream.0.tymed == TYMED_ISTREAM as u32)
+        {
+            medium = stream;
         }
     }
 
-    fn hglobal(&self) -> HGLOBAL {
-        unsafe { self.0.u.hGlobal }
-    }
-}
-
-impl Drop for StgMedium {
-    fn drop(&mut self) {
-        unsafe { ReleaseStgMedium(&mut self.0) };
-    }
-}
-
-unsafe fn read_unicode_text(data_obj: *const IDataObject) -> Result<Option<String>, HRESULT> {
-    let Some(medium) = unsafe { StgMedium::get(data_obj, CF_UNICODETEXT) }? else {
-        return Ok(None);
+    let payload = match medium.0.tymed as i32 {
+        TYMED_HGLOBAL if format.known() == Some(KnownFormat::FileList) => unsafe {
+            read_file_list(medium.0.u.hGlobal as HDROP)
+        },
+        TYMED_HGLOBAL => {
+            let hglobal = unsafe { medium.0.u.hGlobal };
+            match unsafe { GlobalSize(hglobal) } {
+                // An empty global memory object has no memory to lock.
+                0 if !hglobal.is_null() => decode(format, Cow::Borrowed(&[])),
+                _ => LockedGlobal::lock(hglobal)
+                    .and_then(|locked| decode(format, Cow::Borrowed(locked.bytes()))),
+            }
+        },
+        TYMED_ISTREAM => {
+            decode(format, Cow::Owned(unsafe { read_stream(medium.0.u.pstm.cast()) }?))
+        },
+        _ => None,
     };
-    let hglobal = medium.hglobal();
+    payload.ok_or(ReadError::Invalid)
+}
 
-    let ptr = unsafe { GlobalLock(hglobal) };
-    if ptr.is_null() {
-        return Ok(None);
+/// A locked global memory object, unlocked on drop.
+struct LockedGlobal {
+    hglobal: HGLOBAL,
+    data: *const u8,
+}
+
+impl LockedGlobal {
+    fn lock(hglobal: HGLOBAL) -> Option<Self> {
+        let data = unsafe { GlobalLock(hglobal) };
+        (!data.is_null()).then(|| Self { hglobal, data: data.cast() })
     }
 
-    // `CF_UNICODETEXT` is a NUL-terminated UTF-16 string. Cap the scan by the allocation size in
-    // case the buffer isn't terminated.
-    let max_units = unsafe { GlobalSize(hglobal) } / std::mem::size_of::<u16>();
-    let wide = unsafe { std::slice::from_raw_parts(ptr.cast::<u16>(), max_units) };
-    let len = wide.iter().position(|&c| c == 0).unwrap_or(max_units);
-    let text = String::from_utf16_lossy(&wide[..len]);
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data, GlobalSize(self.hglobal)) }
+    }
+}
 
-    unsafe { GlobalUnlock(hglobal) };
+impl Drop for LockedGlobal {
+    fn drop(&mut self) {
+        unsafe { GlobalUnlock(self.hglobal) };
+    }
+}
 
-    Ok(Some(text))
+/// Reads the data that `GetData` returned in a stream: from the start of the stream to its seek
+/// pointer, or to its end when the seek pointer is at its start.
+///
+/// # Safety
+///
+/// `stream` must point to an `IStream`.
+unsafe fn read_stream(stream: *mut IStream) -> Result<Vec<u8>, ReadError> {
+    const CHUNK: usize = 64 * 1024;
+
+    let vtbl = unsafe { &**stream.cast::<*const IStreamVtbl>() };
+    // `GetData` leaves the seek pointer at the end of the data. A stream whose seek pointer is at
+    // its start, or that cannot tell where it is, is read to its end instead.
+    let mut end = 0;
+    let hr = unsafe { (vtbl.Seek)(stream, 0, STREAM_SEEK_CUR, &mut end) };
+    let len = (hr >= 0 && end > 0).then(|| usize::try_from(end).unwrap_or(usize::MAX));
+    if len.is_some() {
+        let hr = unsafe { (vtbl.Seek)(stream, 0, STREAM_SEEK_SET, std::ptr::null_mut()) };
+        if hr < 0 {
+            return Err(ReadError::Call { call: "IStream::Seek", hr });
+        }
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let wanted = len.map_or(CHUNK, |len| (len - bytes.len()).min(CHUNK));
+        if wanted == 0 {
+            return Ok(bytes);
+        }
+        bytes.reserve(wanted);
+        let mut read = 0;
+        let spare = bytes.spare_capacity_mut().as_mut_ptr();
+        let hr = unsafe { (vtbl.Read)(stream, spare.cast(), wanted as u32, &mut read) };
+        if hr < 0 {
+            return Err(ReadError::Call { call: "IStream::Read", hr });
+        }
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let new_len = bytes.len() + (read as usize).min(wanted);
+        unsafe { bytes.set_len(new_len) };
+    }
 }
 
 /// Characters that must be percent-encoded inside a `file:` URI path segment.
@@ -252,12 +503,12 @@ fn uri_to_file_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(out))
 }
 
-unsafe fn read_uri_list(data_obj: *const IDataObject) -> Result<Option<Vec<String>>, HRESULT> {
-    let Some(medium) = unsafe { StgMedium::get(data_obj, CF_HDROP) }? else {
-        return Ok(None);
-    };
-    let hdrop = medium.hglobal() as HDROP;
-
+/// Reads the files of a `CF_HDROP` as `file:` URIs, or returns `None` if it lists none.
+///
+/// # Safety
+///
+/// `hdrop` must be the global memory object of a `CF_HDROP`.
+unsafe fn read_file_list(hdrop: HDROP) -> Option<Payload> {
     // The second parameter (0xFFFFFFFF) instructs the function to return the item count.
     let item_count = unsafe { DragQueryFileW(hdrop, 0xffff_ffff, std::ptr::null_mut(), 0) };
 
@@ -279,42 +530,18 @@ unsafe fn read_uri_list(data_obj: *const IDataObject) -> Result<Option<Vec<Strin
         paths.push(file_path_to_uri(&path).unwrap_or_else(|| path.to_string_lossy().into_owned()));
     }
 
-    Ok(Some(paths))
+    (!paths.is_empty()).then_some(Payload::Uris(paths))
 }
 
-unsafe fn read_png(data_obj: *const IDataObject) -> Result<Option<Vec<u8>>, HRESULT> {
-    let format_name = util::encode_wide("PNG");
-    let format = unsafe { RegisterClipboardFormatW(format_name.as_ptr()) };
-    if format == 0 {
-        return Ok(None);
-    }
-
-    let Some(medium) = unsafe { StgMedium::get(data_obj, format as u16) }? else {
-        return Ok(None);
-    };
-    let hglobal = medium.hglobal();
-
-    let ptr = unsafe { GlobalLock(hglobal) };
-    if ptr.is_null() {
-        return Ok(None);
-    }
-
-    let len = unsafe { GlobalSize(hglobal) };
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec();
-
-    unsafe { GlobalUnlock(hglobal) };
-
-    Ok(Some(bytes))
-}
-
+/// The formats on offer in a data transfer.
 #[derive(Debug)]
 pub(crate) struct WinDataTransfer {
-    data: Arc<DataObject>,
+    formats: Formats,
 }
 
 impl WinDataTransfer {
-    pub(crate) fn new(data: Arc<DataObject>) -> Self {
-        Self { data }
+    pub(crate) fn new(formats: Formats) -> Self {
+        Self { formats }
     }
 }
 
@@ -323,55 +550,66 @@ impl DataTransfer for WinDataTransfer {
         &'this self,
         func: &'_ mut dyn FnMut(&'this dyn TransferType) -> ControlFlow<()>,
     ) {
-        for hint in self.data.data.keys() {
-            if let ControlFlow::Break(()) = func(hint) {
+        for available in self.formats.iter() {
+            if let ControlFlow::Break(()) = func(&available.format) {
                 break;
             }
         }
     }
 }
 
+/// The data of a data transfer in one format.
 #[derive(Debug)]
 pub(crate) struct WinTypedData {
-    type_: TypeHint,
-    data: Arc<DataObject>,
+    format: ClipboardFormat,
+    payload: Arc<Payload>,
 }
 
 impl WinTypedData {
-    pub(crate) fn new(data: Arc<DataObject>, requested: TypeHint) -> Option<Self> {
-        let type_ = data.resolve(requested)?;
-        Some(Self { type_, data })
+    fn new(format: ClipboardFormat, payload: Payload) -> Self {
+        Self { format, payload: Arc::new(payload) }
     }
 }
 
 impl TypedData for WinTypedData {
     fn type_(&self) -> &dyn TransferType {
-        &self.type_
+        &self.format
     }
 
     fn try_read(&self) -> Option<Box<dyn io::BufRead>> {
-        match self.data.data.get(&self.type_)? {
-            SendData::Bytes(bytes) => Some(Box::new(io::Cursor::new(bytes.clone()))),
-            SendData::String(string) => {
-                Some(Box::new(io::Cursor::new(string.clone().into_bytes())))
+        match *self.payload {
+            Payload::Text(_) | Payload::Bytes(_) => {
+                Some(Box::new(io::Cursor::new(PayloadBytes(self.payload.clone()))))
             },
-            // Windows URI drag-and-drop can't be neatly expressed as a binary blob.
-            SendData::Uris(_) => None,
-            _ => None,
+            // A list of URIs can't be neatly expressed as a binary blob.
+            Payload::Uris(_) => None,
         }
     }
 
     fn try_as_uris(&self) -> io::Result<Vec<String>> {
-        match self.data.data.get(&self.type_) {
-            Some(SendData::Uris(uris)) => Ok(uris.clone()),
+        match &*self.payload {
+            Payload::Uris(uris) => Ok(uris.clone()),
             _ => Err(io::ErrorKind::InvalidData.into()),
         }
     }
 
     fn try_as_string(&self) -> io::Result<String> {
-        match self.data.data.get(&self.type_) {
-            Some(SendData::String(string)) => Ok(string.clone()),
+        match &*self.payload {
+            Payload::Text(text) => Ok(text.clone()),
             _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+}
+
+/// The bytes of a text or binary payload, shared with the readers handed out for it.
+struct PayloadBytes(Arc<Payload>);
+
+impl AsRef<[u8]> for PayloadBytes {
+    fn as_ref(&self) -> &[u8] {
+        match &*self.0 {
+            Payload::Text(text) => text.as_bytes(),
+            Payload::Bytes(bytes) => bytes,
+            Payload::Uris(_) => &[],
         }
     }
 }
@@ -506,10 +744,13 @@ impl FileDropHandler {
         pdwEffect: *mut u32,
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
-        // If this is a self-drop (we initiated the drag from this process), reuse the source's id
-        // and seed actions from the mask declared at `start_drag` - the app's `DragEntered`
-        // handler can't call `set_valid_actions` in time because it's buffered until `DoDragDrop`
-        // returns.
+        let Some(data_object) = (unsafe { ComPtr::from_borrowed(pDataObj as *mut IDataObject) })
+        else {
+            unsafe { pdwEffect.write(DROPEFFECT_NONE) };
+            return E_INVALIDARG;
+        };
+        // A drop of a drag that this process started gets the drag's id, so that the application
+        // can match the two.
         let data_transfer_id = drop_handler
             .runner
             .source_drag
@@ -519,8 +760,7 @@ impl FileDropHandler {
 
         let wid = WindowId::from_raw(drop_handler.window.addr());
 
-        let data = Arc::new(unsafe { DataObject::from_idataobject(pDataObj) }.unwrap_or_default());
-        drop_handler.runner.data_transfer().register_drag(data_transfer_id, wid, data);
+        drop_handler.runner.data_transfer().register_drag(data_transfer_id, wid, data_object);
 
         let pt_screen = POINT { x: pt.x, y: pt.y };
         let mut pt_client = pt_screen;
@@ -535,15 +775,14 @@ impl FileDropHandler {
 
         // Get actions after the event handler has run, so that we update it based on the user's
         // supplied info.
-        {
-            let actions =
-                drop_handler.runner.data_transfer().current_drag_actions(data_transfer_id);
-            let source_allowed = unsafe { pdwEffect.read() };
-
-            let new_effect = pick_effect(&actions, grfKeyState, source_allowed);
-            unsafe {
-                pdwEffect.write(new_effect);
-            }
+        let source_allowed = unsafe { pdwEffect.read() };
+        let new_effect = drop_handler.runner.data_transfer().drop_effect(
+            data_transfer_id,
+            grfKeyState,
+            source_allowed,
+        );
+        unsafe {
+            pdwEffect.write(new_effect);
         }
 
         // Forward to the shell drop-target helper so any drag image attached by the source's
@@ -599,8 +838,8 @@ impl FileDropHandler {
 
         // Get actions after the event handler has run, so that we update it based on the user's
         // supplied info.
-        let actions = drop_handler.runner.data_transfer().current_drag_actions(data_transfer_id);
-        let new_effect = pick_effect(&actions, grfKeyState, effects);
+        let new_effect =
+            drop_handler.runner.data_transfer().drop_effect(data_transfer_id, grfKeyState, effects);
         unsafe {
             pdwEffect.write(new_effect);
         }
@@ -664,48 +903,44 @@ impl FileDropHandler {
             proposed_action,
         });
 
-        // New scope to make sure that the `Ref` returned by `current_drag_actions` is dropped
-        // before we call `remove_drag`.
-        {
-            // Get actions after the event handler has run, so that we update it based on the user's
-            // supplied info.
-            let actions =
-                drop_handler.runner.data_transfer().current_drag_actions(data_transfer_id);
-            let source_allowed = unsafe { pdwEffect.read() };
-            let proposed_action =
-                drop_handler.runner.data_transfer().proposed_dnd_action(data_transfer_id, effects);
+        // Get actions after the event handler has run, so that we update it based on the user's
+        // supplied info.
+        let transfers = drop_handler.runner.data_transfer();
+        let proposed_action = transfers.proposed_dnd_action(data_transfer_id, effects);
 
-            // Negotiate the effect first so we can pick the right outgoing event. If the app
-            // rejected the drop (e.g. via `set_valid_actions(none())`), `pick_effect` returns
-            // `DROPEFFECT_NONE`; in that case OLE reports back `effect_out == DROPEFFECT_NONE` to
-            // the source, so the matching observer-facing event is `DragLeft`, not `DragDropped` -
-            // otherwise target and source see contradictory outcomes.
-            let effect = pick_effect(&actions, grfKeyState, source_allowed);
-            let event = if effect == DROPEFFECT_NONE {
-                WindowEvent::DragLeft { id: data_transfer_id }
-            } else {
-                WindowEvent::DragDropped { id: data_transfer_id, proposed_action }
-            };
-            (drop_handler.send_event)(event);
+        // Negotiate the effect first so we can pick the right outgoing event. If the app
+        // rejected the drop (e.g. via `set_valid_actions(none())`), `pick_effect` returns
+        // `DROPEFFECT_NONE`; in that case OLE reports back `effect_out == DROPEFFECT_NONE` to
+        // the source, so the matching observer-facing event is `DragLeft`, not `DragDropped` -
+        // otherwise target and source see contradictory outcomes.
+        let effect = transfers.drop_effect(data_transfer_id, grfKeyState, effects);
+        let event = if effect == DROPEFFECT_NONE {
+            WindowEvent::DragLeft { id: data_transfer_id }
+        } else {
+            WindowEvent::DragDropped { id: data_transfer_id, proposed_action }
+        };
+        unsafe {
+            *pdwEffect = effect;
+        }
+        // The handler of `DragDropped` reads the data, which uses the transfer state, so none of
+        // it is borrowed here.
+        (drop_handler.send_event)(event);
+
+        if let Some(helper) = drop_handler.drop_target_helper {
+            let vtbl = unsafe { Self::helper_vtbl(helper) };
             unsafe {
-                *pdwEffect = effect;
-            }
-
-            if let Some(helper) = drop_handler.drop_target_helper {
-                let vtbl = unsafe { Self::helper_vtbl(helper) };
-                unsafe {
-                    (vtbl.Drop)(helper.as_ptr(), pDataObj as *mut IDataObject, &pt_screen, effect);
-                }
+                (vtbl.Drop)(helper.as_ptr(), pDataObj as *mut IDataObject, &pt_screen, effect);
             }
         }
 
-        // External drop: the app's handler dispatched synchronously above and has already read
-        // the data; safe to release the cache. Self-drop: the handler is buffered and hasn't
-        // run yet, so defer cleanup until after `dispatch_buffered_events` drains.
-        if drop_handler.runner.source_drag.get().is_some() {
-            drop_handler.runner.defer_source_drag_cleanup(data_transfer_id);
+        // The event was dispatched before `send_event` returned, and its handler has read the
+        // data, unless a handler was running, which is when the drop came from a modal loop inside
+        // it: the event was buffered then, and the drag is released once the buffered events have
+        // been dispatched.
+        if drop_handler.runner.should_buffer() {
+            drop_handler.runner.defer_drag_cleanup(data_transfer_id);
         } else {
-            drop_handler.runner.data_transfer().remove_drag(data_transfer_id);
+            transfers.remove_drag(data_transfer_id);
         }
 
         S_OK
@@ -883,40 +1118,26 @@ pub(crate) fn wait_for_clipboard() {
     thread::sleep(Duration::from_millis(10));
 }
 
-fn snapshot_clipboard() -> Result<DataObject, TransferError> {
-    ensure_ole_initialized().map_err(|err| os_error!(err))?;
-
-    let mut ptr: *mut c_void = std::ptr::null_mut();
-    let hr =
-        retry_while_clipboard_busy(|| unsafe { OleGetClipboard(&mut ptr) }, wait_for_clipboard);
-    if hr != S_OK || ptr.is_null() {
-        return Err(os_error!(format!("OleGetClipboard failed: 0x{hr:08x}")).into());
-    }
-    let data_obj = ptr as *mut IDataObject;
-
-    let data = unsafe { DataObject::from_idataobject(data_obj) };
-
-    let release = unsafe { (*(*data_obj).cast::<IDataObjectVtbl>()).parent.Release };
-    unsafe { release(data_obj as *mut IUnknown) };
-
-    data.map_err(|hr| os_error!(format!("Clipboard read failed: 0x{hr:08x}")).into())
-}
-
 /// State for the single drag-and-drop transfer currently in flight (OLE guarantees at most one
 /// active drag per process).
 #[derive(Debug)]
-pub(crate) struct DragState {
-    pub(crate) id: DataTransferId,
-    pub(crate) window_id: WindowId,
-    pub(crate) data: Arc<DataObject>,
-    pub(crate) actions: Vec<DndAction>,
+struct DragState {
+    id: DataTransferId,
+    window_id: WindowId,
+    /// The drop's data object, shared through an `Rc`: a use of the drag takes a share while the
+    /// state is borrowed, which, unlike `ComPtr::clone`, makes no call into the data object.
+    data_object: Rc<ComPtr<IDataObject>>,
+    /// The formats on offer, listed on first use.
+    formats: Option<Formats>,
+    actions: Vec<DndAction>,
 }
 
 #[derive(Debug)]
 struct ClipboardState {
     sequence: u32,
     id: DataTransferId,
-    data: Option<Arc<DataObject>>,
+    /// The formats on offer, listed on first use.
+    formats: Option<Formats>,
 }
 
 impl ClipboardState {
@@ -925,7 +1146,29 @@ impl ClipboardState {
     }
 }
 
+/// Where the data of a transfer comes from.
+enum Source {
+    Drag(Rc<ComPtr<IDataObject>>),
+    Clipboard,
+}
+
+impl Source {
+    fn open(self) -> Result<Rc<ComPtr<IDataObject>>, TransferError> {
+        match self {
+            Self::Drag(data_object) => Ok(data_object),
+            // The clipboard's data object stands for whatever the clipboard holds when it is
+            // used, so it is opened for each use instead of being kept.
+            Self::Clipboard => open_clipboard().map(Rc::new),
+        }
+    }
+}
+
 /// The state of all in-progress data transfer operations (drag-and-drop and clipboard).
+///
+/// A call into another process's data object runs a modal loop that dispatches messages, which
+/// may use this state again. So the state is never borrowed while OLE runs: a data object and
+/// the formats are taken out of it first, and a data object that is dropped from it is released
+/// once the borrow has ended.
 #[derive(Debug, Default)]
 pub(crate) struct DataTransferState {
     drag: RefCell<Option<DragState>>,
@@ -938,27 +1181,31 @@ impl DataTransferState {
         &self,
         id: DataTransferId,
         window_id: WindowId,
-        data: Arc<DataObject>,
+        data_object: ComPtr<IDataObject>,
     ) {
-        *self.drag.borrow_mut() =
-            Some(DragState { id, window_id, data, actions: Default::default() });
+        let data_object = Rc::new(data_object);
+        let drag = DragState { id, window_id, data_object, formats: None, actions: Vec::new() };
+        let replaced = self.drag.replace(Some(drag));
+        drop(replaced);
     }
 
     pub(crate) fn remove_drag(&self, id: DataTransferId) {
-        let mut state = self.drag.borrow_mut();
-        if state.as_ref().is_some_and(|s| s.id == id) {
-            *state = None;
-        }
+        let removed = self.drag.borrow_mut().take_if(|drag| drag.id == id);
+        drop(removed);
     }
 
-    pub(crate) fn drag_state(&self, id: DataTransferId) -> Option<Ref<'_, DragState>> {
-        Ref::filter_map(self.drag.borrow(), |state| state.as_ref().filter(|s| s.id == id)).ok()
-    }
-
-    pub(crate) fn current_drag_actions(&self, id: DataTransferId) -> Ref<'_, [DndAction]> {
-        Ref::map(self.drag.borrow(), |state| {
-            state.as_ref().filter(|s| s.id == id).map(|s| &s.actions[..]).unwrap_or_default()
-        })
+    /// The effect of dropping drag `id` with the modifier keys `key_state` held, when its source
+    /// allows the effects `source_allowed`: the effect of the actions the application accepts.
+    pub(crate) fn drop_effect(
+        &self,
+        id: DataTransferId,
+        key_state: u32,
+        source_allowed: DropEffect,
+    ) -> DropEffect {
+        let drag = self.drag.borrow();
+        let actions =
+            drag.as_ref().filter(|drag| drag.id == id).map_or(&[][..], |drag| &drag.actions);
+        pick_effect(actions, key_state, source_allowed)
     }
 
     pub(crate) fn set_valid_dnd_actions(&self, id: DataTransferId, actions: &[DndAction]) -> bool {
@@ -977,7 +1224,10 @@ impl DataTransferState {
         id: DataTransferId,
         effects: DropEffect,
     ) -> Option<DndAction> {
-        self.current_drag_actions(id).iter().copied().find(|action| {
+        let drag = self.drag.borrow();
+        let actions =
+            drag.as_ref().filter(|drag| drag.id == id).map_or(&[][..], |drag| &drag.actions);
+        actions.iter().copied().find(|action| {
             let effect = match action {
                 DndAction::Move => DROPEFFECT_MOVE,
                 DndAction::Copy => DROPEFFECT_COPY,
@@ -997,33 +1247,96 @@ impl DataTransferState {
             .get_or_insert_with(|| ClipboardState {
                 sequence,
                 id: next_data_transfer_id(),
-                data: None,
+                formats: None,
             })
             .id
     }
 
-    pub(crate) fn clipboard_data(
+    /// The window to deliver the data of transfer `id` to: the window of a drag, or `None` for
+    /// the clipboard, which belongs to no window.
+    pub(crate) fn transfer_window(
         &self,
         id: DataTransferId,
-    ) -> Result<Arc<DataObject>, TransferError> {
-        match &*self.clipboard.borrow() {
-            Some(state) if state.is_current(id) => {
-                if let Some(data) = &state.data {
-                    return Ok(data.clone());
-                }
-            },
-            _ => return Err(TransferError::UnknownTransfer(id)),
+    ) -> Result<Option<WindowId>, TransferError> {
+        if let Some(drag) = self.drag.borrow().as_ref().filter(|drag| drag.id == id) {
+            return Ok(Some(drag.window_id));
         }
+        match &*self.clipboard.borrow() {
+            Some(clipboard) if clipboard.is_current(id) => Ok(None),
+            _ => Err(TransferError::UnknownTransfer(id)),
+        }
+    }
 
-        let data = Arc::new(snapshot_clipboard()?);
-
-        match &mut *self.clipboard.borrow_mut() {
-            Some(state) if state.is_current(id) => {
-                state.data = Some(data.clone());
-                Ok(data)
+    /// The source of transfer `id`, with its formats if they were listed already.
+    fn source(&self, id: DataTransferId) -> Result<(Source, Option<Formats>), TransferError> {
+        if let Some(drag) = self.drag.borrow().as_ref().filter(|drag| drag.id == id) {
+            return Ok((Source::Drag(Rc::clone(&drag.data_object)), drag.formats.clone()));
+        }
+        match &*self.clipboard.borrow() {
+            Some(clipboard) if clipboard.is_current(id) => {
+                Ok((Source::Clipboard, clipboard.formats.clone()))
             },
             _ => Err(TransferError::UnknownTransfer(id)),
         }
+    }
+
+    /// Lists the formats of `data_object`, the source of transfer `id`, and keeps them for the
+    /// transfer.
+    fn list_formats(
+        &self,
+        id: DataTransferId,
+        data_object: &ComPtr<IDataObject>,
+    ) -> Result<Formats, TransferError> {
+        let formats = offered_formats(data_object)?;
+        if let Some(drag) = self.drag.borrow_mut().as_mut().filter(|drag| drag.id == id) {
+            drag.formats = Some(formats.clone());
+            return Ok(formats);
+        }
+        match &mut *self.clipboard.borrow_mut() {
+            Some(clipboard) if clipboard.is_current(id) => {
+                clipboard.formats = Some(formats.clone());
+                Ok(formats)
+            },
+            // The transfer ended while its formats were listed.
+            _ => Err(TransferError::UnknownTransfer(id)),
+        }
+    }
+
+    /// The formats on offer in transfer `id`.
+    pub(crate) fn available_formats(&self, id: DataTransferId) -> Result<Formats, TransferError> {
+        match self.source(id)? {
+            (_, Some(formats)) => Ok(formats),
+            (source, None) => self.list_formats(id, &*source.open()?),
+        }
+    }
+
+    /// Reads `type_` from transfer `id`, from the first of its matching formats that can be read.
+    ///
+    /// The data is read before this returns: reading from another process waits until that
+    /// process has rendered the data, and the wait cannot be interrupted.
+    pub(crate) fn read(
+        &self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+    ) -> Result<WinTypedData, TransferError> {
+        let (source, formats) = self.source(id)?;
+        let data_object = source.open()?;
+        let formats = match formats {
+            Some(formats) => formats,
+            None => self.list_formats(id, &data_object)?,
+        };
+        let mut result = Err(ReadError::Invalid);
+        for available in candidates(&formats, type_) {
+            result = read_format(&data_object, available)
+                .map(|payload| WinTypedData::new(available.format.clone(), payload));
+            if result.is_ok() {
+                break;
+            }
+        }
+        drop(data_object);
+        // The clipboard may have changed, or the drag ended, while the data was read.
+        self.transfer_window(id)?;
+        Ok(result?)
     }
 
     pub(crate) fn set_owns_clipboard(&self) {
@@ -1047,8 +1360,9 @@ impl DataTransferState {
     }
 
     pub(crate) fn reset(&self) {
-        self.drag.take();
+        let drag = self.drag.take();
         self.clipboard.take();
+        drop(drag);
     }
 }
 
