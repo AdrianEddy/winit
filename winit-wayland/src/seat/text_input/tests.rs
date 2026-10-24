@@ -43,6 +43,22 @@ fn a_done_applies_its_pending_state_in_the_protocols_order() {
     assert!(done(&mut data).is_empty());
 }
 
+/// A batch whose `done` delivers to no window — the window's input method disabled, or no surface —
+/// is consumed by that `done`, not left for the next one. After the input method is enabled again,
+/// an unrelated batch's `done` delivers that batch alone: no stale deletion, commit or preedit of
+/// the first.
+#[test]
+fn a_done_that_delivers_nothing_discards_its_batch() {
+    let mut data = TextInputDataInner::default();
+    data.pending_delete = delete(1, 0);
+    data.pending_commit = Some("stale".to_owned());
+    data.pending_preedit = Some(Preedit::from_event(Some("x".to_owned()), 1, 1));
+    data.discard_pending();
+    data.pending_commit = Some("new".to_owned());
+    assert_eq!(done(&mut data), [Ime::Commit("new".to_owned())]);
+    assert!(done(&mut data).is_empty(), "nothing of the discarded batch arrives later");
+}
+
 /// A commit that ends a shown preedit is delivered alone: the commit replaces the preedit, so no
 /// empty preedit precedes it, and the next empty `done` has nothing left to clear.
 #[test]
