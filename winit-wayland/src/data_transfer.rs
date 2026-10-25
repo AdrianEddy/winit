@@ -65,12 +65,18 @@ pub struct MimeType {
 // MIME types
 // Files
 const TEXT_URI_LIST: &str = "text/uri-list";
-// Plaintext
+// Plaintext and HTML: the canonical spelling of UTF-8 text, which other clients and XWayland's
+// bridges look for, the bare type, and the spelling with a space that winit used before.
 const TEXT_PLAIN: &str = "text/plain";
-const TEXT_PLAIN_CHARSET_UTF8: &str = "text/plain; charset=utf-8";
-// HTML
+const TEXT_PLAIN_CHARSET_UTF8: &str = "text/plain;charset=utf-8";
+const TEXT_PLAIN_CHARSET_UTF8_SPACED: &str = "text/plain; charset=utf-8";
 const TEXT_HTML: &str = "text/html";
-const TEXT_HTML_CHARSET_UTF8: &str = "text/html; charset=utf-8";
+const TEXT_HTML_CHARSET_UTF8: &str = "text/html;charset=utf-8";
+const TEXT_HTML_CHARSET_UTF8_SPACED: &str = "text/html; charset=utf-8";
+// Charsets, whose names are compared case-insensitively (RFC 2046, section 4.1.2).
+const UTF_8: &str = "utf-8";
+/// The default charset of `text/plain` (RFC 2046, section 4.1.2), a subset of UTF-8.
+const US_ASCII: &str = "us-ascii";
 // RTF
 const APPLICATION_RTF: &str = "application/rtf";
 // Audio
@@ -103,7 +109,7 @@ impl std::error::Error for UnexpectedCharsetError<'_> {}
 
 impl fmt::Display for UnexpectedCharsetError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Unsupported charset: {}", self.0)
+        write!(f, "Unsupported charset in MIME type {}", self.0)
     }
 }
 
@@ -111,12 +117,15 @@ impl MimeType {
     const MIME_HINT_MAP: &[(&str, TypeHint)] = &[
         // Files
         (TEXT_URI_LIST, TypeHint::UriList),
-        // Plaintext
-        (TEXT_PLAIN, TypeHint::Plaintext),
+        // Plaintext, offered in this order: receivers that take the first type they recognise get
+        // the one that says UTF-8.
         (TEXT_PLAIN_CHARSET_UTF8, TypeHint::Plaintext),
-        // HTML
-        (TEXT_HTML, TypeHint::Html),
+        (TEXT_PLAIN, TypeHint::Plaintext),
+        (TEXT_PLAIN_CHARSET_UTF8_SPACED, TypeHint::Plaintext),
+        // HTML, likewise
         (TEXT_HTML_CHARSET_UTF8, TypeHint::Html),
+        (TEXT_HTML, TypeHint::Html),
+        (TEXT_HTML_CHARSET_UTF8_SPACED, TypeHint::Html),
         // RTF
         (APPLICATION_RTF, TypeHint::Rtf),
         // Audio
@@ -178,29 +187,43 @@ impl MimeType {
         downcast.into_iter().chain(from_hint)
     }
 
-    // TODO: We should properly parse MIME types using `mime` or a similar crate.
+    /// The charset to decode and encode text of this type in. Text is UTF-8, which also covers a
+    /// type without a charset and US-ASCII; any other charset is refused.
     fn parse_charset(&self) -> Result<Charset, UnexpectedCharsetError<'_>> {
-        let Some((_, charset)) = self
-            .mime
-            .split_once(';')
-            .and_then(|(_essence, options)| options.split_once("charset="))
-        else {
-            return Ok(Default::default());
+        match TextCharset::of(&self.mime) {
+            TextCharset::Unstated | TextCharset::UsAscii | TextCharset::Utf8 => Ok(Charset::Utf8),
+            TextCharset::Other => Err(UnexpectedCharsetError(&self.mime)),
+        }
+    }
+
+    /// The hint of text, plain or HTML, in whatever spelling the type is written: `text/plain` or
+    /// `text/html` in any case, without a charset or with the charset UTF-8 or US-ASCII.
+    fn text_hint(mime: &str) -> Option<TypeHint> {
+        let essence = essence(mime);
+        let hint = if essence.eq_ignore_ascii_case(TEXT_PLAIN) {
+            TypeHint::Plaintext
+        } else if essence.eq_ignore_ascii_case(TEXT_HTML) {
+            TypeHint::Html
+        } else {
+            return None;
         };
-
-        let charset = charset.split_once(',').map(|(first, _)| first).unwrap_or(charset).trim();
-
-        if charset == "utf-8" { Ok(Charset::Utf8) } else { Err(UnexpectedCharsetError(charset)) }
+        (TextCharset::of(mime) != TextCharset::Other).then_some(hint)
     }
 
     fn parse(mime: String) -> Self {
-        let hint = Self::MIME_HINT_MAP
-            .iter()
-            .find_map(|(haystack, hint)| (*haystack == &*mime).then_some(*hint))
+        let has_prefix = |prefix: &str| {
+            mime.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        };
+        let hint = Self::text_hint(&mime)
             .or_else(|| {
-                if mime.starts_with("image/") {
+                Self::MIME_HINT_MAP.iter().find_map(|(haystack, hint)| {
+                    haystack.eq_ignore_ascii_case(&mime).then_some(*hint)
+                })
+            })
+            .or_else(|| {
+                if has_prefix("image/") {
                     Some(TypeHint::Image { extension_hint: None })
-                } else if mime.starts_with("audio/") {
+                } else if has_prefix("audio/") {
                     Some(TypeHint::Audio { extension_hint: None })
                 } else {
                     None
@@ -209,7 +232,236 @@ impl MimeType {
 
         Self { mime: mime.into(), hint }
     }
+
+    /// How this type ranks among the types offered for its hint, lowest first: text that says it
+    /// is UTF-8 comes before text without a charset or in US-ASCII, which a reader cannot tell
+    /// from text in the sender's locale.
+    fn read_rank(&self) -> u8 {
+        match self.hint {
+            Some(TypeHint::Plaintext | TypeHint::Html) => {
+                u8::from(TextCharset::of(&self.mime) != TextCharset::Utf8)
+            },
+            _ => 0,
+        }
+    }
 }
+
+/// The essence of a MIME type, `type/subtype`: what precedes its parameters.
+fn essence(mime: &str) -> &str {
+    mime.split_once(';').map_or(mime, |(essence, _)| essence).trim_matches(is_lws)
+}
+
+/// Whether `essence` is the essence of text, `text/plain` or `text/html`, in any case.
+fn is_text_essence(essence: &str) -> bool {
+    essence.eq_ignore_ascii_case(TEXT_PLAIN) || essence.eq_ignore_ascii_case(TEXT_HTML)
+}
+
+/// Linear white space, which may surround the parts of a MIME type's parameters (RFC 2045, section
+/// 5.1, after RFC 822): a space or a tab.
+fn is_lws(char: char) -> bool {
+    char == ' ' || char == '\t'
+}
+
+/// What the parameters of a MIME type say about the charset of its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextCharset {
+    /// No `charset` parameter.
+    Unstated,
+    UsAscii,
+    Utf8,
+    /// A charset that is not decoded: another one, an empty one, conflicting ones, one in RFC
+    /// 2231's form (`charset*`, `charset*0`), or one that does not follow the grammar; for text,
+    /// also any other parameter that does not follow the grammar.
+    Other,
+}
+
+/// A parameter that does not follow the grammar of RFC 2045.
+struct Malformed;
+
+impl TextCharset {
+    /// The charset that the parameters of `mime` state.
+    ///
+    /// The parameters are read as RFC 2045 (section 5.1) writes them: each one follows a `;` and
+    /// is `attribute=value`, where the attribute is a token, compared case-insensitively, and the
+    /// value is a token or a quoted string; linear white space (a space or a tab) may surround the
+    /// `;`, the `=` and the parameter. A quoted string is read up to its closing quote, a `\`
+    /// quoting the next character, and its content is not otherwise checked. Two more shapes are
+    /// allowed, in which nothing can hide: an empty parameter (`;;`, or a `;` at the end), and a
+    /// lone token other than `charset`, without `=` (`;flowed`), which is skipped.
+    ///
+    /// Any other parameter does not follow the grammar: a comment, text after a value, an attribute
+    /// or an unquoted value that is not a token (an empty value is not one), an unterminated quoted
+    /// string, and a `charset` without a value. In text, `text/plain` and `text/html`, such a
+    /// parameter makes the charset `Other`, so that no charset can hide in parameters that are read
+    /// some other way. In other types, which are read leniently, it is skipped as a piece up to the
+    /// next raw `;` and states no charset, unless that piece may state one
+    /// ([`may_state_charset`]): unless it contains `charset`, in any case, followed by `=`, with
+    /// linear white space between them or not, or its attribute is a charset in RFC 2231's form.
+    /// That makes the charset `Other`. A charset that the other parameters state is still read,
+    /// and a well-formed parameter is read exactly (a `charset=` inside a quoted value is no
+    /// charset). The skip does not respect quotes: a malformed quoted string can end the piece at
+    /// a `;` inside it, which shifts where the next piece starts, and a charset in such input is
+    /// not guaranteed to be refused.
+    fn of(mime: &str) -> Self {
+        let strict = is_text_essence(essence(mime));
+        let mut rest = mime.split_once(';').map_or("", |(_, parameters)| parameters);
+        let mut charset = None;
+        loop {
+            rest = rest.trim_start_matches(is_lws);
+            if rest.is_empty() {
+                return charset.unwrap_or(Self::Unstated);
+            }
+            if let Some(after) = rest.strip_prefix(';') {
+                rest = after;
+                continue;
+            }
+
+            let this = match parameter(rest) {
+                Ok((attribute, value, after)) => {
+                    rest = after;
+                    match value {
+                        _ if is_rfc2231_charset(attribute) => Self::Other,
+                        Some(value) if attribute.eq_ignore_ascii_case("charset") => {
+                            Self::named(value)
+                        },
+                        _ => continue,
+                    }
+                },
+                Err(Malformed) if strict => return Self::Other,
+                Err(Malformed) => {
+                    let (malformed, after) = rest.split_at(rest.find(';').unwrap_or(rest.len()));
+                    if may_state_charset(malformed) {
+                        return Self::Other;
+                    }
+                    rest = after;
+                    continue;
+                },
+            };
+            if charset.is_some_and(|earlier| earlier != this) {
+                return Self::Other;
+            }
+            charset = Some(this);
+        }
+    }
+
+    fn named(value: ParameterValue<'_>) -> Self {
+        if value.eq_ignore_ascii_case(UTF_8) {
+            Self::Utf8
+        } else if value.eq_ignore_ascii_case(US_ASCII) {
+            Self::UsAscii
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Reads the parameter at the start of `text`, which neither is empty nor starts with `;` or linear
+/// white space ([`TextCharset::of`]): its attribute, its value (`None` for a lone token), and what
+/// follows it, which is empty or starts with `;`.
+fn parameter(text: &str) -> Result<(&str, Option<ParameterValue<'_>>, &str), Malformed> {
+    let end = text.find(|char| char == ';' || char == '=').unwrap_or(text.len());
+    let attribute = text[..end].trim_end_matches(is_lws);
+    if !is_token(attribute) {
+        return Err(Malformed);
+    }
+    let Some(after) = text[end..].strip_prefix('=') else {
+        return if attribute.eq_ignore_ascii_case("charset") {
+            Err(Malformed)
+        } else {
+            Ok((attribute, None, &text[end..]))
+        };
+    };
+    let (value, after) = ParameterValue::read(after.trim_start_matches(is_lws)).ok_or(Malformed)?;
+    let after = after.trim_start_matches(is_lws);
+    if !after.is_empty() && !after.starts_with(';') {
+        return Err(Malformed);
+    }
+    Ok((attribute, Some(value), after))
+}
+
+/// Whether a piece of a parameter that does not follow the grammar, `malformed`, up to the next raw
+/// `;`, may state a charset, which cannot be read ([`TextCharset::of`]). A lone `charset` states
+/// none.
+fn may_state_charset(malformed: &str) -> bool {
+    const CHARSET: &[u8] = b"charset";
+    let attribute = malformed.split_once('=').map_or(malformed, |(attribute, _)| attribute);
+    let bytes = malformed.as_bytes();
+    is_rfc2231_charset(attribute.trim_end_matches(is_lws))
+        || bytes.windows(CHARSET.len()).enumerate().any(|(start, word)| {
+            word.eq_ignore_ascii_case(CHARSET)
+                && bytes[start + CHARSET.len()..]
+                    .iter()
+                    .find(|&&byte| !is_lws(char::from(byte)))
+                    .is_some_and(|&byte| byte == b'=')
+        })
+}
+
+/// Whether `text` is a token of RFC 2045 (section 5.1): one or more US-ASCII characters other than
+/// space, the control characters and the `tspecials`.
+fn is_token(text: &str) -> bool {
+    const TSPECIALS: &[u8] = b"()<>@,;:\\\"/[]?=";
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_graphic() && !TSPECIALS.contains(&byte))
+}
+
+/// Whether the attribute `attribute` is a charset in RFC 2231's form (`charset*`, or a section of
+/// one, `charset*0`), which is not decoded.
+fn is_rfc2231_charset(attribute: &str) -> bool {
+    // The ASCII `*` makes its index a character boundary, at which the attribute can be sliced.
+    attribute.len() > "charset".len()
+        && attribute.as_bytes()["charset".len()] == b'*'
+        && attribute[.."charset".len()].eq_ignore_ascii_case("charset")
+}
+
+/// The value of a MIME type's parameter: a token, or the inside of a quoted string, in which a
+/// `\` quotes the next character. It is read where it stands, without allocating.
+#[derive(Debug, Clone, Copy)]
+struct ParameterValue<'a> {
+    text: &'a str,
+    quoted: bool,
+}
+
+impl<'a> ParameterValue<'a> {
+    /// Reads the value at the start of `text`, returning it and what follows it, or `None` for an
+    /// unquoted value that is not a token, or an unterminated quoted string.
+    fn read(text: &'a str) -> Option<(Self, &'a str)> {
+        let Some(quoted) = text.strip_prefix('"') else {
+            let end = text.find(';').unwrap_or(text.len());
+            let token = text[..end].trim_end_matches(is_lws);
+            return is_token(token).then_some((Self { text: token, quoted: false }, &text[end..]));
+        };
+        let mut escaped = false;
+        let close = quoted.char_indices().find_map(|(index, char)| {
+            match (escaped, char) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => return Some(index),
+                (false, _) => {},
+            }
+            None
+        })?;
+        Some((Self { text: &quoted[..close], quoted: true }, &quoted[close + 1..]))
+    }
+
+    /// The characters of the value, with each quoted pair standing for the character it quotes.
+    fn chars(self) -> impl Iterator<Item = char> + 'a {
+        let mut chars = self.text.chars();
+        std::iter::from_fn(move || match chars.next()? {
+            '\\' if self.quoted => chars.next(),
+            char => Some(char),
+        })
+    }
+
+    fn eq_ignore_ascii_case(self, other: &str) -> bool {
+        let mut other = other.chars();
+        self.chars().all(|char| other.next().is_some_and(|o| o.eq_ignore_ascii_case(&char)))
+            && other.next().is_none()
+    }
+}
+
+/// Tests of the MIME types: their parsing, the types offered, read and sent.
+#[cfg(test)]
+mod mime_tests;
 
 impl fmt::Display for MimeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -230,10 +482,15 @@ impl TryFrom<TypeHint> for MimeType {
     type Error = UnknownTypeHint;
 
     fn try_from(hint: TypeHint) -> Result<Self, Self::Error> {
-        let mime = Self::MIME_HINT_MAP
-            .iter()
-            .find_map(|(mime, haystack)| (*haystack == hint).then_some(*mime))
-            .ok_or(UnknownTypeHint(hint))?;
+        // Text keeps its bare type here, whichever spelling is offered first.
+        let mime = match hint {
+            TypeHint::Plaintext => Some(TEXT_PLAIN),
+            TypeHint::Html => Some(TEXT_HTML),
+            _ => Self::MIME_HINT_MAP
+                .iter()
+                .find_map(|(mime, haystack)| (*haystack == hint).then_some(*mime)),
+        }
+        .ok_or(UnknownTypeHint(hint))?;
 
         Ok(Self { mime: mime.to_owned().into(), hint: Some(hint) })
     }
@@ -371,9 +628,13 @@ impl DataOffer {
             Some(mime_type) => Some(mime_type),
             None => {
                 let hint = type_.hint()?;
-                self.mime_types.iter().find(|mime_type| {
-                    mime_type.hint().is_some_and(|haystack| haystack.matches(&hint))
-                })
+                // The first offered type of the best rank: text that says it is UTF-8 first.
+                self.mime_types
+                    .iter()
+                    .filter(|mime_type| {
+                        mime_type.hint().is_some_and(|haystack| haystack.matches(&hint))
+                    })
+                    .min_by_key(|mime_type| mime_type.read_rank())
             },
         }
     }
@@ -646,20 +907,34 @@ where
     out
 }
 
+/// The bytes that answer a request for `send_data` as `mime`, or `None` when it cannot be sent so.
+fn send_data_bytes(mime: &MimeType, send_data: SendData) -> Option<Vec<u8>> {
+    match send_data {
+        SendData::Uris(strings) => Some(encode_uri_list(strings)),
+        SendData::String(str) => match TextCharset::of(&mime.mime) {
+            TextCharset::Unstated | TextCharset::Utf8 => Some(str.into_bytes()),
+            // Asked for by name, US-ASCII must be what is sent.
+            TextCharset::UsAscii if str.is_ascii() => Some(str.into_bytes()),
+            TextCharset::UsAscii => {
+                tracing::error!("Text that is not ASCII cannot be sent as {mime}");
+                None
+            },
+            TextCharset::Other => {
+                tracing::error!("{}", UnexpectedCharsetError(&mime.mime));
+                None
+            },
+        },
+        SendData::Bytes(binary) => Some(binary),
+        _ => None,
+    }
+}
+
 impl WinitState {
     fn write_send_data(&self, mime: MimeType, send_data: SendData, fd: WritePipe) {
-        let mut encoder = match send_data {
-            SendData::Uris(strings) => Cursor::new(encode_uri_list(strings)),
-            SendData::String(str) => match mime.parse_charset() {
-                Ok(Charset::Utf8) => Cursor::new(str.into_bytes()),
-                Err(e) => {
-                    tracing::error!("{e}");
-                    return;
-                },
-            },
-            SendData::Bytes(binary) => Cursor::new(binary),
-            _ => return,
+        let Some(bytes) = send_data_bytes(&mime, send_data) else {
+            return;
         };
+        let mut encoder = Cursor::new(bytes);
 
         let _ = self.loop_handle.insert_source(fd, move |_, file, _| {
             // SAFETY: We only mutate `file` in-place and do not replace and drop it.
