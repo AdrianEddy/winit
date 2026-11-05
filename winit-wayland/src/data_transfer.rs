@@ -34,6 +34,7 @@ use wayland_client::protocol::wl_data_device::WlDataDevice;
 use wayland_client::protocol::wl_data_device_manager::DndAction as WlDndAction;
 use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_client::protocol::wl_data_source::WlDataSource;
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy, QueueHandle};
@@ -46,6 +47,7 @@ use winit_core::event_loop::{AsyncRequestSerial, DndAction, DragIcon};
 use winit_core::icon::RgbaIcon;
 use winit_core::window::WindowId;
 
+use crate::seat::WinitSeatState;
 use crate::state::WinitState;
 use crate::{image_to_buffer, make_data_transfer_id};
 
@@ -1329,7 +1331,16 @@ pub struct DragSource {
     /// Whether the drop was performed; the drag then ends when the target finishes it.
     dropped: bool,
     window_id: WindowId,
+    /// The seat and id of the touch point the drag started from.
+    touch_origin: Option<(ObjectId, i32)>,
     _icon: Option<Surface>,
+}
+
+/// The press a drag starts from.
+enum DragOrigin {
+    Touch(i32),
+    Tablet,
+    Pointer,
 }
 
 impl DragSource {
@@ -1339,6 +1350,7 @@ impl DragSource {
         data: Box<dyn DataTransferSend>,
         icon: Option<Surface>,
         window_id: WindowId,
+        touch_origin: Option<(ObjectId, i32)>,
     ) -> Self {
         Self {
             data_transfer_id,
@@ -1347,6 +1359,7 @@ impl DragSource {
             selected_action: WlDndAction::None,
             dropped: false,
             window_id,
+            touch_origin,
             _icon: icon,
         }
     }
@@ -1398,7 +1411,7 @@ impl WinitState {
         });
 
         let windows = self.windows.borrow();
-        let window = windows
+        let mut window = windows
             .get(&source)
             .ok_or(os_error!("Tried to initiate drag, but source window ID was invalid"))?
             .lock()
@@ -1406,19 +1419,29 @@ impl WinitState {
 
         const NO_POINTER_CAP: &str =
             "Tried to initiate drag, but source window does not have the pointer capability";
+        const NO_DATA_DEVICE: &str =
+            "Tried to initiate drag, but the seat of its press has no data device";
 
-        let seat = window
-            .focused_seats()
-            // HACK: How do we get the correct seat for pointers here?
-            .find_map(|seat| self.seats.get(seat).filter(|seat| seat.data_device().is_some()))
-            .ok_or(NotSupportedError::new(NO_POINTER_CAP))?;
-        let data_device = seat.data_device().ok_or(NotSupportedError::new(NO_POINTER_CAP))?;
-
-        let serial = seat
-            .pointer_data()
-            .ok_or(NotSupportedError::new(NO_POINTER_CAP))?
-            .latest_button_serial()
-            .unwrap_or_default();
+        // A compositor starts a drag from an implicit grab: a touch point, a tablet tool or a
+        // pointer button that is still down, on the seat that delivered it.
+        let touch = window.touch_down.as_ref().and_then(|(seat, serial)| {
+            let id = self.seats.get(&seat.id())?.touch_point_with_serial(*serial)?;
+            Some((seat.id(), *serial, id))
+        });
+        let (seat_id, serial, origin) = if let Some((seat, serial, id)) = touch {
+            (seat, serial, DragOrigin::Touch(id))
+        } else if let Some((seat, serial)) = &window.tablet_down {
+            (seat.id(), *serial, DragOrigin::Tablet)
+        } else {
+            let (seat, serial) =
+                window.pointer_press().ok_or(NotSupportedError::new(NO_POINTER_CAP))?;
+            (seat.id(), serial, DragOrigin::Pointer)
+        };
+        let data_device = self
+            .seats
+            .get(&seat_id)
+            .and_then(WinitSeatState::data_device)
+            .ok_or(NotSupportedError::new(NO_DATA_DEVICE))?;
 
         data_source.start_drag(
             data_device,
@@ -1428,13 +1451,35 @@ impl WinitState {
         );
         let transfer_id = make_data_transfer_id(data_device.inner().id(), serial);
 
+        // The compositor takes a touch sequence for the drag and its end does not reach the client,
+        // or not as the end of a press: the drag's own end is the sequence's. A tablet tool's events
+        // are the compositor's to hold back: the tablet protocol sends its `up` and `proximity_out`
+        // when the grab ends.
+        let touch_origin = match origin {
+            DragOrigin::Touch(id) => {
+                if let Some(seat) = self.seats.get_mut(&seat_id) {
+                    seat.release_touch_point(id);
+                    if !seat.is_touched(window.window.wl_surface()) {
+                        window.touch_down = None;
+                    }
+                }
+                Some((seat_id, id))
+            },
+            DragOrigin::Tablet => {
+                window.tablet_down = None;
+                None
+            },
+            DragOrigin::Pointer => None,
+        };
+
         // For some reason, if we commit before starting the drag then the offset isn't applied.
         // This doesn't seem to be documented anywhere, and it's possible that it's a bug in KDE.
         if let Some(surface) = &icon_surface {
             surface.wl_surface().commit();
         }
 
-        let drag = DragSource::new(transfer_id, data_source, send_data, icon_surface, source);
+        let drag =
+            DragSource::new(transfer_id, data_source, send_data, icon_surface, source, touch_origin);
         // An earlier drag that was never dropped cannot end any more: the compositor ignored its
         // `start_drag` without cancelling it. Dropping it destroys its data source.
         for abandoned in self.data_transfer_state.send_drags.start(drag, |drag| drag.dropped) {
@@ -1445,6 +1490,35 @@ impl WinitState {
         }
 
         Ok(transfer_id)
+    }
+
+    /// The touch point `id` of `seat` went up, and it was not down: a drag may have taken it. A
+    /// compositor that took it would not report the release before the drop, so the drag never
+    /// started.
+    pub(crate) fn drag_touch_point_released(&mut self, seat: &WlSeat, id: i32) {
+        let origin = (seat.id(), id);
+        self.cancel_touch_drags(|touch_origin| *touch_origin == origin);
+    }
+
+    /// The compositor cancelled the touch sequences of `seat`. A sequence it took for a drag would
+    /// not be among them, so a drag that started from one on this seat never started.
+    pub(crate) fn drag_touch_points_canceled(&mut self, seat: &WlSeat) {
+        let seat = seat.id();
+        self.cancel_touch_drags(|(touch_seat, _)| *touch_seat == seat);
+    }
+
+    /// Ends every drag from a touch point `is` picks that has not been dropped.
+    fn cancel_touch_drags(&mut self, is: impl Fn(&(ObjectId, i32)) -> bool) {
+        while let Some(drag) = self
+            .data_transfer_state
+            .send_drags
+            .take(|drag| !drag.dropped && drag.touch_origin.as_ref().is_some_and(&is))
+        {
+            self.events_sink.push_window_event(
+                WindowEvent::OutgoingDragCanceled { id: drag.data_transfer_id },
+                drag.window_id,
+            );
+        }
     }
 }
 

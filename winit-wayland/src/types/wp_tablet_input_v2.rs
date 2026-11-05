@@ -54,7 +54,7 @@ impl TabletManager {
         seat: &WlSeat,
         queue_handle: &QueueHandle<WinitState>,
     ) -> ZwpTabletSeatV2 {
-        self.manager.get_tablet_seat(seat, queue_handle, ())
+        self.manager.get_tablet_seat(seat, queue_handle, seat.clone())
     }
 }
 impl Dispatch2<ZwpTabletManagerV2, WinitState> for () {
@@ -70,7 +70,7 @@ impl Dispatch2<ZwpTabletManagerV2, WinitState> for () {
     }
 }
 
-impl Dispatch2<ZwpTabletSeatV2, WinitState> for () {
+impl Dispatch2<ZwpTabletSeatV2, WinitState> for WlSeat {
     event_created_child!(WinitState, ZwpTabletSeatV2, [
         zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (ZwpTabletV2, ()),
         zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (ZwpTabletToolV2, TabletToolData::default()),
@@ -81,10 +81,15 @@ impl Dispatch2<ZwpTabletSeatV2, WinitState> for () {
         &self,
         _: &mut WinitState,
         _: &ZwpTabletSeatV2,
-        _: <ZwpTabletSeatV2 as Proxy>::Event,
+        event: <ZwpTabletSeatV2 as Proxy>::Event,
         _: &Connection,
         _: &QueueHandle<WinitState>,
     ) {
+        if let zwp_tablet_seat_v2::Event::ToolAdded { id } = event {
+            if let Some(data) = id.data::<TabletToolData>() {
+                data.inner.lock().unwrap().seat = Some(self.clone());
+            }
+        }
     }
 }
 
@@ -196,7 +201,7 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
                     let window_id = crate::make_wid(surface);
 
                     // Ensure that window exists.
-                    let window = match state.windows.get_mut().get_mut(&window_id) {
+                    let mut window = match state.windows.get_mut().get_mut(&window_id) {
                         Some(window) => window.lock().unwrap(),
                         None => continue,
                     };
@@ -224,6 +229,13 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
                             if let Some(serial) = serial {
                                 data.latest_button_serial = Some(serial);
                             }
+
+                            window.tablet_down = match (state, serial, data.seat.clone()) {
+                                (ElementState::Pressed, Some(serial), Some(seat)) => {
+                                    Some((seat, serial))
+                                },
+                                _ => None,
+                            };
 
                             WindowEvent::PointerButton {
                                 device_id: None,
@@ -254,6 +266,7 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
                         data.latest_button_serial = None;
                         data.latest_enter_serial = None;
                         data.tool_state = Default::default();
+                        window.tablet_down = None;
                     }
                 }
             },
@@ -290,6 +303,9 @@ pub(crate) struct TabletToolDataInner {
 
     /// The serial of the latest button event for the pointer
     pub(crate) latest_button_serial: Option<u32>,
+
+    /// The seat the tool belongs to.
+    pub(crate) seat: Option<WlSeat>,
 }
 
 // Due to wayland using logical coordinates,

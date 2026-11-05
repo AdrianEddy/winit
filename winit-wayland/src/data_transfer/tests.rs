@@ -129,3 +129,15 @@ fn a_change_of_the_source_actions_shows_in_a_new_snapshot() {
     assert_eq!(before.source_actions(), Some(&[DndAction::Copy][..]));
     assert_eq!(offer.actions_allowed_by_source(), WlDndAction::Copy | WlDndAction::Move);
 }
+
+/// A drag taking every drag `take` picks, as a cancelled touch sequence does: a seat can hold a
+/// drag still finishing beside the one it cancels.
+#[test]
+fn taking_drags_leaves_the_ones_it_does_not_pick() {
+    let mut drags = SendDrags::default();
+    drags.start(test_drag(1, true), |drag| drag.dropped);
+    drags.start(test_drag(2, false), |drag| drag.dropped);
+    assert_eq!(drags.take(|drag| !drag.dropped).map(|drag| drag.id), Some(2));
+    assert!(drags.take(|drag| !drag.dropped).is_none());
+    assert_eq!(drags.take(|drag| drag.dropped).map(|drag| drag.id), Some(1));
+}

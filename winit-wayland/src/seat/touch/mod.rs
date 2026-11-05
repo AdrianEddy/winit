@@ -51,7 +51,7 @@ impl TouchHandler for WinitState {
             seat_state.first_touch_id = Some(id);
         }
         let primary = seat_state.first_touch_id == Some(id);
-        seat_state.touch_map.insert(id, TouchPoint { surface, location });
+        seat_state.touch_map.insert(id, TouchPoint { surface, location, serial });
 
         let position = location.to_physical(scale_factor);
         let finger_id = FingerId::from_raw(id as usize);
@@ -95,23 +95,17 @@ impl TouchHandler for WinitState {
             },
         };
 
-        // Remove the touch point.
-        let touch_point = match seat_state.touch_map.remove(&id) {
+        // Remove the touch point, and update the primary touch point.
+        let (touch_point, primary) = match seat_state.release_touch_point(id) {
             Some(touch_point) => touch_point,
-            None => return,
+            None => {
+                self.drag_touch_point_released(touch.seat(), id);
+                return;
+            },
         };
 
-        // Update the primary touch point.
-        let primary = seat_state.first_touch_id == Some(id);
-        // Reset primary finger once all the other fingers are lifted to not transfer primary
-        // finger to some other finger and still accept it when it's briefly moved between the
-        // windows.
-        if seat_state.touch_map.is_empty() {
-            seat_state.first_touch_id = None;
-        }
-
         let window_id = crate::make_wid(&touch_point.surface);
-        let still_touched = seat_state.touch_map.values().any(|p| p.surface == touch_point.surface);
+        let still_touched = seat_state.is_touched(&touch_point.surface);
         let scale_factor = match self.windows.get_mut().get(&window_id) {
             Some(window) => {
                 let mut window = window.lock().unwrap();
@@ -196,6 +190,8 @@ impl TouchHandler for WinitState {
     }
 
     fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, touch: &WlTouch) {
+        self.drag_touch_points_canceled(touch.seat());
+
         let seat_state = match self.seats.get_mut(&touch.seat().id()) {
             Some(seat_state) => seat_state,
             None => {
@@ -257,6 +253,9 @@ pub struct TouchPoint {
 
     /// The location of the point on the surface.
     pub location: LogicalPosition<f64>,
+
+    /// The serial of the `wl_touch::down` that started the point.
+    pub serial: u32,
 }
 
 pub trait TouchDataExt {

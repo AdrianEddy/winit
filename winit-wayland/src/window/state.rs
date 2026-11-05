@@ -70,6 +70,9 @@ pub struct WindowState {
     /// The seat and serial of the touch currently down on the window, if any.
     pub touch_down: Option<(WlSeat, u32)>,
 
+    /// The seat and serial of the tablet tool currently down on the window, if any.
+    pub tablet_down: Option<(WlSeat, u32)>,
+
     selected_cursor: SelectedCursor,
 
     /// Whether the cursor is visible.
@@ -237,6 +240,7 @@ impl WindowState {
             pointer_constraints,
             pointers: Default::default(),
             touch_down: None,
+            tablet_down: None,
             queue_handle: queue_handle.clone(),
             resizable: true,
             scale_factor,
@@ -260,10 +264,20 @@ impl WindowState {
         self.window.xdg_toplevel()
     }
 
-    // HACK: Currently to get the data device to initiate a drag-and-drop, we iterate through all
-    // focused seats to find one with a pointer capability. This is definitely wrong.
+    /// The seats whose keyboard focus is on the window.
     pub(crate) fn focused_seats(&self) -> impl Iterator<Item = &ObjectId> {
         self.seat_focus.iter()
+    }
+
+    /// The seat and latest button serial of a pointer on the window, if any has one.
+    pub(crate) fn pointer_press(&self) -> Option<(WlSeat, u32)> {
+        let mut press = None;
+        self.apply_on_pointer(|_, data| {
+            if let Some(serial) = data.latest_button_serial() {
+                press = Some((data.seat().clone(), serial));
+            }
+        });
+        press
     }
 
     /// Apply closure on the given pointer.

@@ -294,6 +294,18 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
     /// not currently guarantee that this is supported correctly for either internal or external
     /// drag.
     ///
+    /// ## Platform-specific
+    ///
+    /// - **Wayland:** The drag starts from a press that is still held on `source`, on the seat that
+    ///   delivered it: a touch point, else a tablet tool, else the latest pointer button. The
+    ///   compositor takes a touch sequence for the drag, so its touch point gets neither a release
+    ///   nor a [`PointerLeft`](crate::event::WindowEvent::PointerLeft):
+    ///   [`OutgoingDragDropped`](crate::event::WindowEvent::OutgoingDragDropped) or
+    ///   [`OutgoingDragCanceled`](crate::event::WindowEvent::OutgoingDragCanceled) ends it as well
+    ///   as the drag. A tablet tool's events are reported as the compositor sends them, which the
+    ///   tablet protocol holds back while a grab is on: a tool the drag took sends its release when
+    ///   the drag ends, and one the compositor refused goes on reporting.
+    ///
     /// ### Arguments
     ///
     /// - `source` - The ID of the window that initiated the drag operation.

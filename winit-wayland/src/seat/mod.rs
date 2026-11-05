@@ -8,6 +8,7 @@ use sctk::data_device_manager::data_device::DataDevice;
 use sctk::primary_selection::device::PrimarySelectionDevice;
 use sctk::reexports::client::backend::ObjectId;
 use sctk::reexports::client::protocol::wl_seat::WlSeat;
+use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::protocol::wl_touch::WlTouch;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
@@ -109,6 +110,29 @@ impl WinitSeatState {
 
     pub(crate) fn pointer_data(&self) -> Option<&PointerData<WinitPointerData>> {
         self.pointer.as_ref().and_then(|pointer| pointer.pointer().data())
+    }
+
+    /// The touch point that went down with `serial`, while it is still down.
+    pub(crate) fn touch_point_with_serial(&self, serial: u32) -> Option<i32> {
+        self.touch_map.iter().find(|(_, point)| point.serial == serial).map(|(id, _)| *id)
+    }
+
+    /// Removes the touch point `id`, with whether it was the primary one.
+    pub(crate) fn release_touch_point(&mut self, id: i32) -> Option<(TouchPoint, bool)> {
+        let touch_point = self.touch_map.remove(&id)?;
+        let primary = self.first_touch_id == Some(id);
+        // Reset primary finger once all the other fingers are lifted to not transfer primary
+        // finger to some other finger and still accept it when it's briefly moved between the
+        // windows.
+        if self.touch_map.is_empty() {
+            self.first_touch_id = None;
+        }
+        Some((touch_point, primary))
+    }
+
+    /// Whether a touch point is down on `surface`.
+    pub(crate) fn is_touched(&self, surface: &WlSurface) -> bool {
+        self.touch_map.values().any(|point| point.surface == *surface)
     }
 }
 
