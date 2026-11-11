@@ -43,7 +43,6 @@ use sink::EventSink;
 pub use winit_core::event_loop::EventLoopProxy as CoreEventLoopProxy;
 
 use super::WindowId;
-use super::output::MonitorHandle;
 use super::state::{WindowCompositorUpdate, WinitState};
 use super::window::state::FrameCallbackState;
 
@@ -759,14 +758,11 @@ impl RootActiveEventLoop for ActiveEventLoop {
     }
 
     fn available_monitors(&self) -> Box<dyn Iterator<Item = CoreMonitorHandle>> {
-        Box::new(
-            self.state
-                .borrow()
-                .output_state
-                .outputs()
-                .map(MonitorHandle::new)
-                .map(|inner| CoreMonitorHandle(Arc::new(inner))),
-        )
+        // The monitors the output handler has announced: an output that is bound but not yet
+        // described (no name, position or mode) joins at its first `done`, when
+        // `monitors_generation` moves.
+        let monitors = self.state.borrow().monitors.lock().unwrap().clone();
+        Box::new(monitors.into_iter().map(|inner| CoreMonitorHandle(Arc::new(inner))))
     }
 
     fn primary_monitor(&self) -> Option<CoreMonitorHandle> {

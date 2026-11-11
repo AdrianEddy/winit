@@ -90,6 +90,10 @@ pub struct WinitState {
     /// Observed monitors.
     pub monitors: Arc<Mutex<Vec<MonitorHandle>>>,
 
+    /// The number of changes to `monitors` so far: one for each output described for the first
+    /// time, each later change to an output's description, and each output removed.
+    pub monitors_generation: u64,
+
     /// Sink to accumulate window events from the compositor, which is latter dispatched in
     /// event loop run.
     pub events_sink: EventSink,
@@ -166,7 +170,13 @@ impl WinitState {
         };
 
         let output_state = OutputState::new(globals, queue_handle);
-        let monitors = output_state.outputs().map(MonitorHandle::new).collect();
+        // Only the outputs described already: a version-1 output, which has no `done`. Every other
+        // output joins at its first `done` (`new_output`), as one bound later does.
+        let monitors = output_state
+            .outputs()
+            .filter(|output| output_state.info(output).is_some())
+            .map(MonitorHandle::new)
+            .collect();
 
         let seat_state = SeatState::new(globals, queue_handle);
 
@@ -238,6 +248,7 @@ impl WinitState {
             pointer_gestures: PointerGesturesState::new(globals, queue_handle).ok(),
 
             monitors: Arc::new(Mutex::new(monitors)),
+            monitors_generation: 0,
             events_sink: EventSink::new(),
             loop_handle,
             // Make it true by default.
@@ -287,6 +298,13 @@ impl WinitState {
                 window_state.lock().unwrap().reload_cursor_style()
             }
         }
+    }
+
+    /// Count a change to `monitors`, once the list holds it, and have the event loop run
+    /// `about_to_wait` for it: the application may read the new list there.
+    fn monitors_changed(&mut self) {
+        self.monitors_generation += 1;
+        self.dispatched_events = true;
     }
 
     pub fn queue_close(updates: &mut Vec<WindowCompositorUpdate>, window_id: WindowId) {
@@ -415,24 +433,31 @@ impl OutputHandler for WinitState {
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
         self.monitors.lock().unwrap().push(MonitorHandle::new(output));
+        self.monitors_changed();
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, updated: WlOutput) {
-        let mut monitors = self.monitors.lock().unwrap();
-        let updated = MonitorHandle::new(updated);
-        if let Some(pos) = monitors.iter().position(|output| output == &updated) {
-            monitors[pos] = updated
-        } else {
-            monitors.push(updated)
+        {
+            let mut monitors = self.monitors.lock().unwrap();
+            let updated = MonitorHandle::new(updated);
+            if let Some(pos) = monitors.iter().position(|output| output == &updated) {
+                monitors[pos] = updated
+            } else {
+                monitors.push(updated)
+            }
         }
+        self.monitors_changed();
     }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, removed: WlOutput) {
-        let mut monitors = self.monitors.lock().unwrap();
-        let removed = MonitorHandle::new(removed);
-        if let Some(pos) = monitors.iter().position(|output| output == &removed) {
-            monitors.remove(pos);
+        {
+            let mut monitors = self.monitors.lock().unwrap();
+            let removed = MonitorHandle::new(removed);
+            if let Some(pos) = monitors.iter().position(|output| output == &removed) {
+                monitors.remove(pos);
+            }
         }
+        self.monitors_changed();
     }
 }
 

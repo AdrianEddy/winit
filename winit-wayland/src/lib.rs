@@ -56,12 +56,33 @@ pub use self::window::Window;
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.
     fn is_wayland(&self) -> bool;
+
+    /// A count that grows by one at each change to the monitors, or [`None`] if the
+    /// [`ActiveEventLoop`] does not use Wayland.
+    ///
+    /// A change is a `wl_output` described for the first time (its first `done`), a later change
+    /// to its description (each later `done`), or its removal (the global's `global_remove`).
+    /// The count moves once the monitor lists hold the change, and the event loop then runs
+    /// [`ApplicationHandler::about_to_wait`] even if nothing else happened: an application that
+    /// keeps the count it last read can compare it there, and read
+    /// [`ActiveEventLoop::available_monitors`] again when it differs. That list holds only the
+    /// outputs described so far, and changes only where the count moves.
+    ///
+    /// [`ApplicationHandler::about_to_wait`]: winit_core::application::ApplicationHandler::about_to_wait
+    /// [`ActiveEventLoop::available_monitors`]: winit_core::event_loop::ActiveEventLoop::available_monitors
+    fn monitors_generation(&self) -> Option<u64>;
 }
 
 impl ActiveEventLoopExtWayland for dyn CoreActiveEventLoop + '_ {
     #[inline]
     fn is_wayland(&self) -> bool {
         self.cast_ref::<ActiveEventLoop>().is_some()
+    }
+
+    #[inline]
+    fn monitors_generation(&self) -> Option<u64> {
+        let event_loop = self.cast_ref::<ActiveEventLoop>()?;
+        Some(event_loop.state.borrow().monitors_generation)
     }
 }
 
