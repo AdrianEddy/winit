@@ -53,7 +53,10 @@ pub struct WinitSeatState {
     /// Id of the first touch event.
     first_touch_id: Option<i32>,
 
-    /// The text input bound on the seat.
+    /// The text input of the seat. It lives with the seat: created with it when the compositor
+    /// has a text-input manager, and destroyed with it. Text-input focus follows the keyboard
+    /// focus only while the seat has the keyboard capability, and the compositor decides it
+    /// otherwise, so the text input waits for no capability and outlives a capability's loss.
     text_input: Option<Arc<ZwpTextInputV3>>,
 
     /// The tablet input bound on the seat.
@@ -90,8 +93,17 @@ pub struct WinitSeatState {
 }
 
 impl WinitSeatState {
-    pub fn new() -> Self {
-        Default::default()
+    /// The state of a new `seat`, with its text input when the compositor has a text-input
+    /// manager.
+    pub fn new(
+        seat: &WlSeat,
+        text_input_state: Option<&TextInputState>,
+        queue_handle: &QueueHandle<WinitState>,
+    ) -> Self {
+        let text_input = text_input_state.map(|text_input_state| {
+            Arc::new(text_input_state.get_text_input(seat, queue_handle, TextInputData::default()))
+        });
+        Self { text_input, ..Default::default() }
     }
 
     /// Returns the serial of the most recent input event on this seat, or `None` if none has
@@ -229,16 +241,6 @@ impl SeatHandler for WinitState {
             _ => (),
         }
 
-        if let Some(text_input_state) =
-            seat_state.text_input.is_none().then_some(self.text_input_state.as_ref()).flatten()
-        {
-            seat_state.text_input = Some(Arc::new(text_input_state.get_text_input(
-                &seat,
-                queue_handle,
-                TextInputData::default(),
-            )));
-        }
-
         if let Some(tablet_state) =
             seat_state.tablet.is_none().then_some(self.tablet_state.as_ref()).flatten()
         {
@@ -317,10 +319,11 @@ impl SeatHandler for WinitState {
     fn new_seat(
         &mut self,
         _connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
+        queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        self.seats.insert(seat.id(), WinitSeatState::new());
+        let seat_state = WinitSeatState::new(&seat, self.text_input_state.as_ref(), queue_handle);
+        self.seats.insert(seat.id(), seat_state);
     }
 
     fn remove_seat(

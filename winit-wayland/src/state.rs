@@ -179,10 +179,12 @@ impl WinitState {
             .collect();
 
         let seat_state = SeatState::new(globals, queue_handle);
+        let text_input_state = TextInputState::new(globals, queue_handle).ok();
 
         let mut seats = HashMap::default();
         for seat in seat_state.seats() {
-            seats.insert(seat.id(), WinitSeatState::new());
+            let seat_data = WinitSeatState::new(&seat, text_input_state.as_ref(), queue_handle);
+            seats.insert(seat.id(), seat_data);
         }
 
         let (viewporter_state, fractional_scaling_manager) =
@@ -237,7 +239,7 @@ impl WinitState {
             data_transfer_state: Default::default(),
 
             seats,
-            text_input_state: TextInputState::new(globals, queue_handle).ok(),
+            text_input_state,
 
             relative_pointer: RelativePointerState::new(globals, queue_handle).ok(),
             tablet_state: TabletManager::new(globals, queue_handle).ok(),
