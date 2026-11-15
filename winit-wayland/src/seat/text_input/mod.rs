@@ -104,18 +104,11 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 state.events_sink.push_window_event(WindowEvent::Ime(Ime::Disabled), window_id);
             },
             TextInputEvent::PreeditString { text, cursor_begin, cursor_end } => {
-                text_input_data.pending_preedit =
-                    Some(Preedit::from_event(text, cursor_begin, cursor_end))
+                text_input_data.preedit_string(text, cursor_begin, cursor_end)
             },
-            TextInputEvent::CommitString { text } => {
-                text_input_data.pending_preedit = None;
-                text_input_data.pending_commit = text;
-            },
+            TextInputEvent::CommitString { text } => text_input_data.commit_string(text),
             TextInputEvent::DeleteSurroundingText { before_length, after_length } => {
-                text_input_data.pending_delete = Some(DeleteSurroundingText {
-                    before: before_length as usize,
-                    after: after_length as usize,
-                });
+                text_input_data.delete_surrounding_text(before_length, after_length)
             },
             TextInputEvent::Done { .. } => {
                 // The window this `done` delivers to, if any: none without a surface, and none for
@@ -225,6 +218,27 @@ impl Default for TextInputDataInner {
 }
 
 impl TextInputDataInner {
+    /// A `preedit_string` event: the batch's new preedit.
+    fn preedit_string(&mut self, text: Option<String>, cursor_begin: i32, cursor_end: i32) {
+        self.pending_preedit = Some(Preedit::from_event(text, cursor_begin, cursor_end));
+    }
+
+    /// A `commit_string` event: the batch's commit. text-input-v3 double-buffers it apart from
+    /// the preedit, and `done` inserts the commit before the new preedit, so a preedit the batch
+    /// set before its commit is kept: an input method commits a conversion and starts the next
+    /// composition in one batch.
+    fn commit_string(&mut self, text: Option<String>) {
+        self.pending_commit = text;
+    }
+
+    /// A `delete_surrounding_text` event: the batch's deletion.
+    fn delete_surrounding_text(&mut self, before_length: u32, after_length: u32) {
+        self.pending_delete = Some(DeleteSurroundingText {
+            before: before_length as usize,
+            after: after_length as usize,
+        });
+    }
+
     /// The `Ime` events a `done` delivers, taking the pending state they apply.
     fn take_done_events(&mut self) -> impl Iterator<Item = Ime> + use<> {
         // The events are sent to the user separately, so

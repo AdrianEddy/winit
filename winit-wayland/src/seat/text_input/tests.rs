@@ -102,3 +102,25 @@ fn a_reset_of_an_empty_preedit_sends_no_clear() {
     data.pending_preedit = Some(Preedit::from_event(None, 0, 0));
     assert!(done(&mut data).is_empty(), "the preedit was already empty");
 }
+
+/// A batch whose `preedit_string` comes before its `commit_string` — the order wlroots' input
+/// method relay sends them in — delivers both: the commit, then the new preedit. The two are
+/// double-buffered apart, so the commit does not drop the preedit.
+#[test]
+fn a_commit_keeps_the_preedit_its_batch_set_before_it() {
+    let mut data = TextInputDataInner::default();
+    data.preedit_string(Some("g".to_owned()), 1, 1);
+    data.commit_string(Some("日本".to_owned()));
+    assert_eq!(done(&mut data), [
+        Ime::Commit("日本".to_owned()),
+        Ime::Preedit("g".to_owned(), Some((1, 1))),
+    ]);
+
+    // The other order delivers the same.
+    data.commit_string(Some("g".to_owned()));
+    data.preedit_string(Some("h".to_owned()), 1, 1);
+    assert_eq!(done(&mut data), [
+        Ime::Commit("g".to_owned()),
+        Ime::Preedit("h".to_owned(), Some((1, 1))),
+    ]);
+}
