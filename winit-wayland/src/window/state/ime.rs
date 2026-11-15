@@ -1,18 +1,14 @@
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
+use winit_core::event::Ime;
 use winit_core::window::{ImeCapabilities, ImeRequest, ImeRequestError};
 
 use super::WindowState;
-use crate::seat::TextInputClientState;
 
 impl WindowState {
     /// Whether the IME is allowed.
     #[inline]
     pub fn ime_allowed(&self) -> Option<ImeCapabilities> {
         self.ime.state().map(|state| state.capabilities())
-    }
-
-    pub(crate) fn text_input_state(&self) -> Option<&TextInputClientState> {
-        self.ime.state()
     }
 
     /// Atomically update input method state.
@@ -38,10 +34,22 @@ impl WindowState {
         self.ime.enter(text_input)
     }
 
-    /// The text input left the top-level.
+    /// The text input left the top-level, by its `leave` or its destruction with its seat. Returns
+    /// the events its removal pushes (`ImeWindow::remove`).
     #[inline]
-    pub fn text_input_left(&mut self, text_input: &ZwpTextInputV3) {
-        self.ime.remove(text_input);
+    pub fn text_input_removed(&mut self, text_input: &ZwpTextInputV3) -> Vec<Ime> {
+        self.ime.remove(text_input)
+    }
+
+    /// A `done` of a text input entered on the top-level. Returns the events it delivers
+    /// (`ImeWindow::done`); `sync` sends the sync of a displaced composer's reset.
+    pub fn text_input_done(
+        &mut self,
+        text_input: &ZwpTextInputV3,
+        serial: u32,
+        sync: impl FnOnce(Vec<(ZwpTextInputV3, u32)>),
+    ) -> Vec<Ime> {
+        self.ime.done(text_input, serial, sync)
     }
 
     /// Whether the window's `Ime::Enabled` is pushed now, as the opening a request owed it

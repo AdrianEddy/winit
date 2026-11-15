@@ -67,6 +67,12 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
         conn: &Connection,
         qhandle: &QueueHandle<WinitState>,
     ) {
+        // A text input destroyed with its seat can still have events queued: they no longer
+        // concern any window (`text_input_destroyed`).
+        if !Proxy::is_alive(text_input) || data.inner.lock().unwrap().destroyed {
+            return;
+        }
+
         // A window's state is locked before the data of a text input, here as where a request
         // applies the window's state to its text inputs (`ImeWindow::request`).
         let windows = state.windows.get_mut();
@@ -99,12 +105,14 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
 
                 // XXX this check is essential, because `leave` could have a
                 // reference to nil surface...
-                match windows.get(&window_id) {
-                    Some(window) => window.lock().unwrap().text_input_left(text_input),
+                let events = match windows.get(&window_id) {
+                    Some(window) => window.lock().unwrap().text_input_removed(text_input),
                     None => return,
-                }
+                };
 
-                state.events_sink.push_window_event(WindowEvent::Ime(Ime::Disabled), window_id);
+                for event in events {
+                    state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
+                }
                 // The window may be owed its opening, which waited for this text input too.
                 state.open_ime_windows();
             },
@@ -117,33 +125,36 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
             },
             TextInputEvent::Done { serial } => {
                 let window_id = data.inner.lock().unwrap().surface.as_ref().map(crate::make_wid);
-                let window = window_id
-                    .and_then(|window_id| windows.get(&window_id))
-                    .map(|window| window.lock().unwrap());
-                let mut text_input_data = data.inner.lock().unwrap();
-
-                // A batch the compositor computed before it applied the latest disable belongs to
-                // the input method state that disable ended.
-                if !text_input_data.admit_done(serial) {
-                    text_input_data.discard_pending();
-                    return;
-                }
-
-                // The window this `done` delivers to, if any: none without a surface, and none for
-                // a window whose IME is disabled, in case some IME sends events for it.
-                let target = window_id.filter(|_| {
-                    window.as_ref().is_none_or(|window| window.text_input_state().is_some())
-                });
 
                 // text-input-v3 resets the pending state at every `done`, so a `done` that delivers
                 // to no window discards it rather than leaving it for the next `done`.
-                match target {
-                    Some(window_id) => {
-                        for event in text_input_data.take_done_events() {
-                            state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
-                        }
+                let Some(window_id) = window_id else {
+                    let mut text_input_data = data.inner.lock().unwrap();
+                    text_input_data.admit_done(serial);
+                    text_input_data.discard_pending();
+                    return;
+                };
+
+                let events = match windows.get(&window_id) {
+                    Some(window) => {
+                        window.lock().unwrap().text_input_done(text_input, serial, |fences| {
+                            ImeSync::send(&conn.display(), qhandle, fences)
+                        })
                     },
-                    None => text_input_data.discard_pending(),
+                    // A surface the event loop holds no window for: its batch is delivered as it
+                    // is.
+                    None => {
+                        let mut text_input_data = data.inner.lock().unwrap();
+                        if !text_input_data.admit_done(serial) {
+                            text_input_data.discard_pending();
+                            return;
+                        }
+                        text_input_data.take_done_events().collect()
+                    },
+                };
+
+                for event in events {
+                    state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
                 }
             },
             _ => {},
@@ -191,6 +202,27 @@ impl Dispatch<WlCallback, ImeSync, WinitState> for TextInputState {
             state.open_ime_windows();
         }
     }
+}
+
+/// `text_input` is destroyed with its seat. It is marked first: wayland-client dispatches the
+/// messages of one socket read after reading them all, so a destroyed text input's `enter`, `done`
+/// or `leave` can still be queued, and they are ignored. Then it leaves the window its text-input
+/// focus is on, as by a `leave`, but sends nothing: the object is gone.
+pub fn text_input_destroyed(state: &mut WinitState, text_input: &ZwpTextInputV3) {
+    let surface = text_input.with_data(|data| {
+        data.destroyed = true;
+        data.discard_pending();
+        data.surface.take()
+    });
+    let Some(window_id) = surface.as_ref().map(crate::make_wid) else { return };
+    let events = match state.windows.get_mut().get(&window_id) {
+        Some(window) => window.lock().unwrap().text_input_removed(text_input),
+        None => return,
+    };
+    for event in events {
+        state.events_sink.push_window_event(WindowEvent::Ime(event), window_id);
+    }
+    state.open_ime_windows();
 }
 
 /// Retires the fences a transition's sync lists: each listed text input that is still alive and
@@ -298,6 +330,9 @@ pub struct TextInputDataInner {
     /// The serial of the latest commit that disabled the text input, until a `done` at or past it
     /// shows that the compositor has sent every batch it computed before it applied that disable.
     fence: Option<u32>,
+
+    /// The text input was destroyed with its seat: its queued events are ignored.
+    destroyed: bool,
 }
 
 impl Default for TextInputDataInner {
@@ -310,6 +345,7 @@ impl Default for TextInputDataInner {
             last_preedit_empty: true,
             commits: 0,
             fence: None,
+            destroyed: false,
         }
     }
 }
@@ -382,6 +418,15 @@ impl TextInputDataInner {
     /// Whether the text input waits for the retirement of a disable's fence.
     fn fenced(&self) -> bool {
         self.fence.is_some()
+    }
+
+    /// Whether the pending batch carries input of its own: a deletion, a commit or a non-empty
+    /// preedit. A batch without any — an empty `done`, or the clear of a preedit — changes only
+    /// what its own text input shows.
+    fn has_content(&self) -> bool {
+        self.pending_delete.is_some()
+            || self.pending_commit.is_some()
+            || self.pending_preedit.as_ref().is_some_and(|preedit| !preedit.text.is_empty())
     }
 
     /// Issues `commit` on `text_input` and counts it, returning its serial: the serial of the

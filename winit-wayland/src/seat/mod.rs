@@ -34,7 +34,7 @@ pub use pointer::pointer_gesture::{PointerGestureData, PointerGesturesState};
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 use text_input::TextInputData;
-pub use text_input::{ClientState as TextInputClientState, ImeSync, ImeWindow, TextInputState};
+pub use text_input::{ImeSync, ImeWindow, TextInputState};
 use touch::TouchPoint;
 
 #[derive(Debug, Default)]
@@ -332,6 +332,7 @@ impl SeatHandler for WinitState {
     ) {
         if let Some(mut seat_state) = self.seats.remove(&seat.id()) {
             if let Some(text_input) = seat_state.text_input.take() {
+                text_input::text_input_destroyed(self, &text_input);
                 text_input.destroy();
             }
         }

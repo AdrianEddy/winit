@@ -519,7 +519,7 @@ fn one_sync_retires_every_member_and_opens_the_window_once() {
     let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
     request(&mut window, &mut syncs, enable());
     assert!(window.enter(&a));
-    assert!(window.enter(&b));
+    assert!(!window.enter(&b), "the window is open already");
     assert!(!callback(&mut window, &mut syncs), "the entered window opened already");
 
     reset(&mut window, &mut syncs);
@@ -543,7 +543,7 @@ fn a_member_that_leaves_mid_reset_does_not_hold_the_window() {
 
     reset(&mut window, &mut syncs);
     let leave_fence = b.with_data(|data| data.disable(&b));
-    assert!(window.remove(&b));
+    assert!(window.remove(&b).is_empty(), "A stays: no `Ime::Disabled`");
     assert!(callback(&mut window, &mut syncs), "A is ready, and B is no member");
     assert_eq!(b.fence(), Some(leave_fence), "B's `leave` fence waits for its own sync");
 }
@@ -632,4 +632,217 @@ fn a_compositor_answering_done_zero_loses_only_the_batches_sent_while_fenced() {
 
     assert!(callback(&mut window, &mut syncs), "the disable's callback retires it and opens");
     assert!(a.with_data(|data| data.admit_done(0)), "after the callback `done(0)` is delivered");
+}
+
+/// The input method of `member` sends a batch: `batch` sets the pending state, and the `done`
+/// carries the serial of the text input's latest commit. Returns the events the window delivers.
+fn send(
+    window: &mut ImeWindow<Fake>,
+    syncs: &mut Syncs,
+    member: &Fake,
+    batch: impl FnOnce(&mut TextInputDataInner),
+) -> Vec<Ime> {
+    let serial = member.with_data(|data| {
+        batch(data);
+        data.commits
+    });
+    window.done(member, serial, |fences| syncs.push(fences))
+}
+
+fn preedit(text: &str) -> impl FnOnce(&mut TextInputDataInner) + '_ {
+    move |data| data.preedit_string(Some(text.to_owned()), text.len() as i32, text.len() as i32)
+}
+
+fn commit(text: &str) -> impl FnOnce(&mut TextInputDataInner) + '_ {
+    move |data| data.commit_string(Some(text.to_owned()))
+}
+
+fn shown(text: &str) -> Ime {
+    Ime::Preedit(text.to_owned(), Some((text.len(), text.len())))
+}
+
+fn cleared() -> Ime {
+    Ime::Preedit(String::new(), None)
+}
+
+/// A window with its input method enabled and open, entered by `seats` text inputs; no request or
+/// sync is left to read.
+fn entered(seats: usize) -> (ImeWindow<Fake>, Syncs, Vec<Fake>) {
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    let members: Vec<Fake> = (0..seats).map(|_| Fake::default()).collect();
+    for member in &members {
+        window.enter(member);
+        member.requests();
+    }
+    assert!(!callback(&mut window, &mut syncs));
+    (window, syncs, members)
+}
+
+/// The composing seat departs — by `leave`, or by its seat's removal with no `leave` — while an
+/// idle seat stays: the departing composition ends with one empty preedit, no `Ime::Disabled` is
+/// pushed, and the window stays open: the seat that stays composes at once.
+#[test]
+fn the_composer_departing_ends_its_composition_and_the_window_stays_open() {
+    for by_leave in [true, false] {
+        let (mut window, mut syncs, members) = entered(2);
+        let (a, b) = (&members[0], &members[1]);
+        assert_eq!(send(&mut window, &mut syncs, a, preedit("p")), [shown("p")]);
+
+        if by_leave {
+            a.with_data(|data| data.disable(a));
+        } else {
+            a.destroy();
+        }
+        assert_eq!(window.remove(a), [cleared()], "the composition ends, the window stays");
+        assert!(!window.take_opening());
+        assert_eq!(send(&mut window, &mut syncs, b, preedit("x")), [shown("x")]);
+    }
+}
+
+/// An idle seat departs while another composes: nothing is pushed, and the composition goes on.
+#[test]
+fn an_idle_seat_departing_pushes_nothing() {
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("p")), [shown("p")]);
+    assert!(window.remove(b).is_empty());
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("pq")), [shown("pq")]);
+}
+
+/// The last member departs while it composes: the window's `Ime::Disabled` alone, with no empty
+/// preedit before it.
+#[test]
+fn the_last_member_departing_pushes_disabled_alone() {
+    let (mut window, mut syncs, members) = entered(1);
+    let a = &members[0];
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("p")), [shown("p")]);
+    assert_eq!(window.remove(a), [Ime::Disabled]);
+}
+
+/// A removal is one operation: a second removal of the same text input, or of one that never
+/// entered, pushes nothing. Each removal discards the member's pending batch.
+#[test]
+fn a_removal_happens_once_and_discards_the_pending_batch() {
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    a.with_data(commit("stale"));
+    assert!(window.remove(a).is_empty());
+    assert!(window.remove(a).is_empty(), "removed already");
+    assert!(window.remove(&Fake::default()).is_empty(), "never entered");
+    assert_eq!(window.remove(b), [Ime::Disabled], "B was the last member");
+
+    window.enter(a);
+    assert!(send(&mut window, &mut syncs, a, |_| ()).is_empty(), "nothing stale is delivered");
+}
+
+/// One batch of a table of cases: the events the compositor sends before a `done`.
+type Batch<'a> = &'a dyn Fn(&mut TextInputDataInner);
+
+/// Another seat's batch with input takes the composition over, by a preedit, a commit or a
+/// deletion: the owner's composition ends first with an empty preedit, and the owner's text input
+/// alone is reset natively — its disable with a fence, a sync listing it alone, its enable with
+/// the window's state — so its input method holds the ended composition no longer. The reset owes
+/// the window no opening.
+#[test]
+fn a_takeover_ends_the_owners_composition_first() {
+    let deletion = |data: &mut TextInputDataInner| data.delete_surrounding_text(1, 0);
+    let cases: [(Batch<'_>, Vec<Ime>); 3] = [
+        (&|data: &mut TextInputDataInner| preedit("x")(data), vec![cleared(), shown("x")]),
+        (&|data: &mut TextInputDataInner| commit("x")(data), vec![
+            cleared(),
+            Ime::Commit("x".to_owned()),
+        ]),
+        (&deletion, vec![
+            cleared(),
+            Ime::DeleteSurrounding { before_bytes: 1, after_bytes: 0 },
+            cleared(),
+        ]),
+    ];
+    for (batch, expected) in cases {
+        let (mut window, mut syncs, members) = entered(2);
+        let (a, b) = (&members[0], &members[1]);
+        assert_eq!(send(&mut window, &mut syncs, a, preedit("p")), [shown("p")]);
+
+        assert_eq!(send(&mut window, &mut syncs, b, batch), expected);
+        assert_eq!(a.requests(), ["disable", "commit", "enable", "cursor_rectangle", "commit"]);
+        assert!(b.requests().is_empty(), "the seat that took over is not reset");
+        let fence = a.fence().expect("the displaced text input is fenced");
+        assert_eq!(syncs, [vec![(a.clone(), fence)]], "one sync, listing the displaced alone");
+
+        assert!(!callback(&mut window, &mut syncs), "the reset owes no opening");
+        assert_eq!(a.fence(), None);
+    }
+}
+
+/// The displaced composer's input method had already computed a commit of the composition when
+/// it was reset: that batch's `done` carries a serial before the reset's fence, and is dropped,
+/// so the ended composition is never committed after its end.
+#[test]
+fn the_displaced_composers_late_batch_is_dropped() {
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    let before_reset = a.with_data(|data| data.commits);
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("p")), [shown("p")]);
+    assert_eq!(send(&mut window, &mut syncs, b, preedit("x")), [cleared(), shown("x")]);
+
+    a.with_data(commit("p"));
+    assert!(window.done(a, before_reset, |fences| syncs.push(fences)).is_empty());
+    assert_eq!(send(&mut window, &mut syncs, b, preedit("xy")), [shown("xy")], "B still owns it");
+}
+
+/// Another seat's batch with no input of its own — an empty `done`, a clear of a preedit the
+/// window does not show — is swallowed: nothing is pushed, and the owner's composition goes on.
+#[test]
+fn a_non_owners_batch_without_input_is_swallowed() {
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("p")), [shown("p")]);
+
+    assert!(send(&mut window, &mut syncs, b, |_| ()).is_empty(), "an empty `done`");
+    assert!(
+        send(&mut window, &mut syncs, b, |data| data.preedit_string(None, 0, 0)).is_empty(),
+        "a clear"
+    );
+    assert!(syncs.is_empty() && a.requests().is_empty(), "no takeover");
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("pq")), [shown("pq")]);
+}
+
+/// The displaced seat composes again: a takeover in turn while the seat that displaced it shows a
+/// preedit, and a composition from nobody's once that seat committed.
+#[test]
+fn the_displaced_seat_composing_again() {
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    send(&mut window, &mut syncs, a, preedit("p"));
+    send(&mut window, &mut syncs, b, preedit("x"));
+    a.requests();
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("pp")), [cleared(), shown("pp")]);
+    assert_eq!(b.requests(), ["disable", "commit", "enable", "cursor_rectangle", "commit"]);
+
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    send(&mut window, &mut syncs, a, preedit("p"));
+    assert_eq!(send(&mut window, &mut syncs, b, commit("x")), [
+        cleared(),
+        Ime::Commit("x".to_owned()),
+    ]);
+    syncs.clear();
+    assert_eq!(send(&mut window, &mut syncs, a, preedit("pq")), [shown("pq")], "nobody owned it");
+    assert!(syncs.is_empty());
+}
+
+/// A request that disables the window's input method ends every member's composition: after the
+/// reset, another seat composes with no takeover.
+#[test]
+fn a_disable_ends_the_ownership() {
+    let (mut window, mut syncs, members) = entered(2);
+    let (a, b) = (&members[0], &members[1]);
+    send(&mut window, &mut syncs, a, preedit("p"));
+    reset(&mut window, &mut syncs);
+    assert!(callback(&mut window, &mut syncs));
+    syncs.clear();
+    a.requests();
+    assert_eq!(send(&mut window, &mut syncs, b, preedit("x")), [shown("x")]);
+    assert!(a.requests().is_empty() && syncs.is_empty(), "no takeover");
 }
