@@ -14,10 +14,16 @@ fn done(data: &mut TextInputDataInner) -> Vec<Ime> {
 fn a_pending_delete_is_delivered_by_one_done_only() {
     let mut data = TextInputDataInner::default();
     data.pending_delete = delete(2, 1);
-    assert_eq!(done(&mut data), [Ime::DeleteSurrounding { before_bytes: 2, after_bytes: 1 }]);
+    assert_eq!(done(&mut data), [
+        Ime::DeleteSurrounding { before_bytes: 2, after_bytes: 1 },
+        Ime::Preedit(String::new(), None),
+    ]);
     assert!(done(&mut data).is_empty(), "a second `done` carries no deletion");
     data.pending_delete = delete(3, 0);
-    assert_eq!(done(&mut data), [Ime::DeleteSurrounding { before_bytes: 3, after_bytes: 0 }]);
+    assert_eq!(done(&mut data), [
+        Ime::DeleteSurrounding { before_bytes: 3, after_bytes: 0 },
+        Ime::Preedit(String::new(), None),
+    ]);
     assert!(done(&mut data).is_empty());
 }
 
@@ -122,5 +128,53 @@ fn a_commit_keeps_the_preedit_its_batch_set_before_it() {
     assert_eq!(done(&mut data), [
         Ime::Commit("g".to_owned()),
         Ime::Preedit("h".to_owned(), Some((1, 1))),
+    ]);
+}
+
+/// A batch that only deletes ends with an empty preedit, so every `done` that delivers anything
+/// ends with a `Commit` or a `Preedit`: while no preedit is shown, the empty preedit closes the
+/// batch and leaves nothing owed to the next `done`; while one is shown, the batch's clear of it
+/// is that close, sent once. A deletion beside a commit or a new preedit adds nothing.
+#[test]
+fn a_delete_only_batch_ends_with_an_empty_preedit() {
+    let mut data = TextInputDataInner::default();
+    data.delete_surrounding_text(1, 0);
+    assert_eq!(done(&mut data), [
+        Ime::DeleteSurrounding { before_bytes: 1, after_bytes: 0 },
+        Ime::Preedit(String::new(), None),
+    ]);
+    assert!(done(&mut data).is_empty(), "the close owes nothing to the next `done`");
+
+    // An empty preedit in the batch is no preedit: the batch still only deletes.
+    data.delete_surrounding_text(2, 0);
+    data.preedit_string(None, 0, 0);
+    assert_eq!(done(&mut data), [
+        Ime::DeleteSurrounding { before_bytes: 2, after_bytes: 0 },
+        Ime::Preedit(String::new(), None),
+    ]);
+
+    data.preedit_string(Some("ab".to_owned()), 2, 2);
+    assert_eq!(done(&mut data), [Ime::Preedit("ab".to_owned(), Some((2, 2)))]);
+    data.delete_surrounding_text(1, 0);
+    assert_eq!(
+        done(&mut data),
+        [
+            Ime::DeleteSurrounding { before_bytes: 1, after_bytes: 0 },
+            Ime::Preedit(String::new(), None)
+        ],
+        "the clear of the shown preedit closes the batch, once"
+    );
+
+    data.delete_surrounding_text(1, 0);
+    data.commit_string(Some("x".to_owned()));
+    assert_eq!(done(&mut data), [
+        Ime::DeleteSurrounding { before_bytes: 1, after_bytes: 0 },
+        Ime::Commit("x".to_owned()),
+    ]);
+    data.delete_surrounding_text(1, 0);
+    data.preedit_string(Some("y".to_owned()), 1, 1);
+    assert_eq!(done(&mut data), [
+        Ime::DeleteSurrounding { before_bytes: 1, after_bytes: 0 },
+        Ime::Preedit("y".to_owned(), Some((1, 1))),
     ]);
 }

@@ -281,7 +281,14 @@ impl TextInputDataInner {
             Some(Ime::Preedit(preedit.text, cursor_range))
         });
 
-        [delete, commit_or_clear, preedit].into_iter().flatten()
+        // A batch that only deletes, while no preedit is shown, ends with an empty preedit, as a
+        // batch that clears a shown preedit does: every `done` that delivers anything then ends
+        // with a `Commit` or a `Preedit`, so the application can tell where one input method
+        // transaction ends and the next begins, however many are delivered together.
+        let close = (delete.is_some() && commit_or_clear.is_none() && preedit.is_none())
+            .then(|| Ime::Preedit(String::new(), None));
+
+        [delete, commit_or_clear, preedit, close].into_iter().flatten()
     }
 
     /// Resets the pending state of a `done` that delivers to no window. text-input-v3 says each
