@@ -29,9 +29,7 @@ use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{ResizeDirection, Theme, WindowId};
 
 use crate::event_loop::OwnedDisplayHandle;
-use crate::seat::{
-    PointerConstraintsState, TextInputClientState, WinitPointerData, WinitPointerDataExt,
-};
+use crate::seat::{ImeWindow, PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 use crate::state::WinitState;
 use crate::types::bgr_effects::{BgrEffectManager, SurfaceBlurEffect};
 use crate::types::cursor::SelectedCursor;
@@ -119,14 +117,9 @@ pub struct WindowState {
     /// The current cursor grabbing mode.
     cursor_grab_mode: GrabState,
 
-    /// The input method properties provided by the application to the IME.
-    ///
-    /// This state is cached here so that the window can automatically send the state to the IME as
-    /// soon as it becomes available without application involvement.
-    text_input_state: Option<TextInputClientState>,
-
-    /// The text inputs observed on the window.
-    text_inputs: Vec<ZwpTextInputV3>,
+    /// The input method of the window: the state the application requested, and the text inputs
+    /// entered on the window.
+    ime: ImeWindow<ZwpTextInputV3>,
 
     /// The surface size of the window, as in without client side decorations.
     size: LogicalSize<u32>,
@@ -233,7 +226,7 @@ impl WindowState {
             frame_callback_state: FrameCallbackState::None,
             seat_focus: Default::default(),
             has_pending_move: None,
-            text_input_state: None,
+            ime: ImeWindow::default(),
             max_surface_size: None,
             min_surface_size: MIN_WINDOW_SIZE,
             resize_increments: None,
@@ -249,7 +242,6 @@ impl WindowState {
             size: initial_size.to_logical(1.),
             stateless_size: initial_size.to_logical(1.),
             initial_size: Some(initial_size),
-            text_inputs: Vec::new(),
             theme,
             title: String::default(),
             transparent: false,

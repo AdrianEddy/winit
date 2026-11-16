@@ -24,6 +24,7 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 use winit_core::error::OsError;
+use winit_core::event::{Ime, WindowEvent};
 
 use crate::WindowId;
 use crate::data_transfer::DataTransferState;
@@ -257,6 +258,17 @@ impl WinitState {
             dispatched_events: true,
             proxy_wake_up: false,
         })
+    }
+
+    /// Pushes the `Ime::Enabled` of every window whose opening is owed and whose text inputs are
+    /// all ready (`ImeWindow::take_opening`), into the compositor's sink: behind every event
+    /// already received from the compositor.
+    pub fn open_ime_windows(&mut self) {
+        for (window_id, window) in self.windows.get_mut().iter() {
+            if window.lock().unwrap().take_ime_opening() {
+                self.events_sink.push_window_event(WindowEvent::Ime(Ime::Enabled), *window_id);
+            }
+        }
     }
 
     pub fn scale_factor_changed(

@@ -1,3 +1,5 @@
+use winit_core::window::{ImeEnableRequest, ImeRequest};
+
 use super::*;
 
 fn delete(before: usize, after: usize) -> Option<DeleteSurroundingText> {
@@ -232,14 +234,14 @@ fn client_state() -> ClientState {
 fn a_done_from_before_the_disable_is_dropped_after_the_re_enable() {
     let text_input = Requests::default();
     let mut data = TextInputDataInner::default();
-    data.set_state(&text_input, Some(&client_state()), true);
+    data.set_state(&text_input, &client_state(), true);
     data.preedit_string(Some("ab".to_owned()), 2, 2);
     assert!(data.admit_done(1));
     assert_eq!(done(&mut data), [Ime::Preedit("ab".to_owned(), Some((2, 2)))]);
 
     // The application's reset: the disable is the second commit, the re-enable the third.
-    data.set_state(&text_input, None, false);
-    data.set_state(&text_input, Some(&client_state()), true);
+    let _ = data.disable(&text_input);
+    data.set_state(&text_input, &client_state(), true);
     let fence = 2;
     assert_eq!(data.fence, Some(fence));
 
@@ -266,9 +268,9 @@ fn every_commit_is_counted_and_each_disable_sets_the_fence() {
     let text_input = Requests::default();
     let mut data = TextInputDataInner::default();
 
-    data.set_state(&text_input, Some(&client_state()), true);
+    data.set_state(&text_input, &client_state(), true);
     assert_eq!(text_input.take(), ["enable", "cursor_rectangle", "commit"]);
-    data.set_state(&text_input, Some(&client_state()), false);
+    data.set_state(&text_input, &client_state(), false);
     assert_eq!(text_input.take(), ["cursor_rectangle", "commit"]);
     assert_eq!((data.commits, data.fence), (2, None));
 
@@ -276,7 +278,7 @@ fn every_commit_is_counted_and_each_disable_sets_the_fence() {
     assert!(data.admit_done(2));
     assert_eq!(done(&mut data), [Ime::Preedit("ab".to_owned(), Some((2, 2)))]);
     data.commit_string(Some("pending".to_owned()));
-    data.set_state(&text_input, None, false);
+    assert_eq!(data.disable(&text_input), 3, "the disable's commit is its fence");
     assert_eq!(text_input.take(), ["disable", "commit"]);
     assert_eq!((data.commits, data.fence), (3, Some(3)));
 
@@ -285,7 +287,7 @@ fn every_commit_is_counted_and_each_disable_sets_the_fence() {
     assert!(done(&mut data).is_empty());
 
     // `leave` disables through the same method.
-    data.disable(&text_input);
+    assert_eq!(data.disable(&text_input), 4);
     assert_eq!(text_input.take(), ["disable", "commit"]);
     assert_eq!((data.commits, data.fence), (4, Some(4)));
 }
@@ -298,8 +300,8 @@ fn the_fence_is_the_latest_disable() {
     let text_input = Requests::default();
     let mut data = TextInputDataInner::default();
     for _ in 0..2 {
-        data.set_state(&text_input, None, false);
-        data.set_state(&text_input, Some(&client_state()), true);
+        let _ = data.disable(&text_input);
+        data.set_state(&text_input, &client_state(), true);
     }
     assert_eq!((data.commits, data.fence), (4, Some(3)));
     assert!(!data.admit_done(1));
@@ -314,10 +316,10 @@ fn the_fence_is_the_latest_disable() {
 fn an_enter_while_fenced_keeps_dropping_the_batches_from_before_the_disable() {
     let text_input = Requests::default();
     let mut data = TextInputDataInner::default();
-    data.set_state(&text_input, Some(&client_state()), true);
-    data.disable(&text_input);
+    data.set_state(&text_input, &client_state(), true);
+    let _ = data.disable(&text_input);
     let fence = data.commits;
-    data.set_state(&text_input, Some(&client_state()), true);
+    data.set_state(&text_input, &client_state(), true);
     assert_eq!(text_input.take(), [
         "enable",
         "cursor_rectangle",
@@ -343,8 +345,8 @@ fn an_enter_while_fenced_keeps_dropping_the_batches_from_before_the_disable() {
 fn the_fence_compares_wrapping() {
     let text_input = Requests::default();
     let mut data = TextInputDataInner { commits: u32::MAX - 1, ..TextInputDataInner::default() };
-    data.set_state(&text_input, None, false);
-    data.set_state(&text_input, Some(&client_state()), true);
+    let _ = data.disable(&text_input);
+    data.set_state(&text_input, &client_state(), true);
     assert_eq!((data.commits, data.fence), (0, Some(u32::MAX)));
     assert!(!data.admit_done(u32::MAX - 1));
     assert!(!data.admit_done(u32::MAX - 2));
@@ -352,6 +354,282 @@ fn the_fence_compares_wrapping() {
     assert_eq!(data.fence, None);
 
     let mut data = TextInputDataInner { commits: u32::MAX - 1, ..TextInputDataInner::default() };
-    data.set_state(&text_input, None, false);
+    let _ = data.disable(&text_input);
     assert!(data.admit_done(u32::MAX), "the fence's own serial");
+}
+
+/// A text input for the window tests: the requests issued on it, its data, and whether it was
+/// destroyed.
+#[derive(Clone, Default)]
+struct Fake(std::rc::Rc<FakeInner>);
+
+#[derive(Default)]
+struct FakeInner {
+    requests: Requests,
+    data: std::cell::RefCell<TextInputDataInner>,
+    destroyed: std::cell::Cell<bool>,
+}
+
+impl Fake {
+    fn requests(&self) -> Vec<&'static str> {
+        self.0.requests.take()
+    }
+
+    fn fence(&self) -> Option<u32> {
+        self.0.data.borrow().fence
+    }
+
+    fn destroy(&self) {
+        self.0.destroyed.set(true);
+    }
+}
+
+impl PartialEq for Fake {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for Fake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Fake({:p})", std::rc::Rc::as_ptr(&self.0))
+    }
+}
+
+impl TextInputRequests for Fake {
+    fn enable(&self) {
+        self.0.requests.enable()
+    }
+
+    fn disable(&self) {
+        self.0.requests.disable()
+    }
+
+    fn set_content_type(&self, hint: ContentHint, purpose: ContentPurpose) {
+        self.0.requests.set_content_type(hint, purpose)
+    }
+
+    fn set_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.0.requests.set_cursor_rectangle(x, y, width, height)
+    }
+
+    fn set_surrounding_text(&self, text: String, cursor: i32, anchor: i32) {
+        self.0.requests.set_surrounding_text(text, cursor, anchor)
+    }
+
+    fn commit_uncounted(&self) {
+        self.0.requests.commit_uncounted()
+    }
+}
+
+impl TextInputHandle for Fake {
+    fn with_data<R>(&self, f: impl FnOnce(&mut TextInputDataInner) -> R) -> R {
+        f(&mut self.0.data.borrow_mut())
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.0.destroyed.get()
+    }
+}
+
+/// The syncs a window's requests send, in order, each as the fences it lists.
+type Syncs = Vec<Vec<(Fake, u32)>>;
+
+fn enable() -> ImeRequest {
+    let request_data = ImeRequestData::default().with_cursor_area(
+        dpi::Position::Logical(dpi::LogicalPosition::new(10.0, 20.0)),
+        dpi::Size::Logical(dpi::LogicalSize::new(1.0, 16.0)),
+    );
+    ImeRequest::Enable(
+        ImeEnableRequest::new(ImeCapabilities::new().with_cursor_area(), request_data).unwrap(),
+    )
+}
+
+/// Sends `request` to `window`, collecting its sync.
+fn request(window: &mut ImeWindow<Fake>, syncs: &mut Syncs, request: ImeRequest) -> Option<bool> {
+    window.request(request, 1.0, |fences| syncs.push(fences)).unwrap()
+}
+
+/// An application's reset of a window's input method: a disable, then an enable.
+fn reset(window: &mut ImeWindow<Fake>, syncs: &mut Syncs) {
+    assert_eq!(request(window, syncs, ImeRequest::Disable), Some(false));
+    assert_eq!(request(window, syncs, enable()), Some(true));
+}
+
+/// The compositor's dispatch of the first sync still waiting, then the window's opening if it is
+/// due: whether it pushes the window's `Ime::Enabled`.
+fn callback(window: &mut ImeWindow<Fake>, syncs: &mut Syncs) -> bool {
+    retire(&syncs.remove(0));
+    window.take_opening()
+}
+
+/// An enable sends no `Ime::Enabled` of its own: the window opens at the compositor's dispatch of
+/// the sync after the disable, once the disable's fence is retired, and only then. On the wire the
+/// reset is `disable, commit, sync, sync, enable, state, commit`.
+#[test]
+fn a_reset_opens_the_window_at_the_disables_callback() {
+    let a = Fake::default();
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    assert!(!window.enter(&a), "the input method is disabled: nothing opens");
+    assert_eq!(request(&mut window, &mut syncs, enable()), Some(true));
+    assert!(callback(&mut window, &mut syncs), "the first enable opens at its own callback");
+    a.requests();
+
+    reset(&mut window, &mut syncs);
+    assert_eq!(a.requests(), ["disable", "commit", "enable", "cursor_rectangle", "commit"]);
+    assert_eq!(syncs.len(), 2, "one sync per transition");
+    assert_eq!(syncs[0], [(a.clone(), 2)], "the disable's sync lists its fence");
+    assert!(syncs[1].is_empty());
+    assert!(!window.take_opening(), "the fence is not retired yet");
+
+    assert!(callback(&mut window, &mut syncs), "the disable's callback opens the window");
+    assert_eq!(a.fence(), None);
+    assert!(!callback(&mut window, &mut syncs), "the enable's callback opens nothing more");
+    assert!(!window.take_opening());
+}
+
+/// Several resets before any callback: each callback retires only its own fence, so the ones of
+/// the earlier resets retire nothing, and the window opens once, at the callback after the last
+/// disable.
+#[test]
+fn only_the_latest_disables_callback_opens_the_window() {
+    let a = Fake::default();
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    window.enter(&a);
+    request(&mut window, &mut syncs, enable());
+    assert!(callback(&mut window, &mut syncs));
+
+    for _ in 0..3 {
+        reset(&mut window, &mut syncs);
+    }
+    assert_eq!(syncs.len(), 6);
+    for _ in 0..4 {
+        assert!(!callback(&mut window, &mut syncs), "an earlier reset's callback opens nothing");
+        assert!(a.fence().is_some());
+    }
+    assert!(callback(&mut window, &mut syncs), "the last disable's callback opens the window");
+    assert!(!callback(&mut window, &mut syncs));
+}
+
+/// A window entered by two seats' text inputs: the reset disables both and its one sync lists both
+/// fences; its callback retires both, and the window opens once.
+#[test]
+fn one_sync_retires_every_member_and_opens_the_window_once() {
+    let (a, b) = (Fake::default(), Fake::default());
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    assert!(window.enter(&a));
+    assert!(window.enter(&b));
+    assert!(!callback(&mut window, &mut syncs), "the entered window opened already");
+
+    reset(&mut window, &mut syncs);
+    assert_eq!(syncs[0].len(), 2);
+    assert!(callback(&mut window, &mut syncs));
+    assert_eq!((a.fence(), b.fence()), (None, None));
+    assert!(!callback(&mut window, &mut syncs));
+}
+
+/// Seat B leaves the window during a reset: it is no longer a member, so the window opens when A,
+/// the one member left, is ready, with no new `enter`. B's own `leave` disable replaced the fence
+/// the reset listed for it, so the reset's callback leaves B's fence to B's own sync.
+#[test]
+fn a_member_that_leaves_mid_reset_does_not_hold_the_window() {
+    let (a, b) = (Fake::default(), Fake::default());
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    window.enter(&a);
+    window.enter(&b);
+    syncs.clear();
+
+    reset(&mut window, &mut syncs);
+    let leave_fence = b.with_data(|data| data.disable(&b));
+    assert!(window.remove(&b));
+    assert!(callback(&mut window, &mut syncs), "A is ready, and B is no member");
+    assert_eq!(b.fence(), Some(leave_fence), "B's `leave` fence waits for its own sync");
+}
+
+/// A destroyed member never answers its sync; it does not hold the window shut.
+#[test]
+fn a_destroyed_member_does_not_hold_the_window() {
+    let (a, b) = (Fake::default(), Fake::default());
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    window.enter(&a);
+    window.enter(&b);
+    syncs.clear();
+
+    reset(&mut window, &mut syncs);
+    b.destroy();
+    assert!(callback(&mut window, &mut syncs));
+    assert!(b.fence().is_some(), "a destroyed text input is not retired");
+}
+
+/// A disable with no re-enable owes nothing: its callback retires the fence and opens nothing. A
+/// later enable owes the opening, which its own callback pushes.
+#[test]
+fn a_disable_alone_opens_nothing_and_a_later_enable_opens_at_its_callback() {
+    let a = Fake::default();
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    window.enter(&a);
+    syncs.clear();
+
+    request(&mut window, &mut syncs, ImeRequest::Disable);
+    assert!(!callback(&mut window, &mut syncs));
+    assert_eq!(a.fence(), None);
+
+    request(&mut window, &mut syncs, enable());
+    assert!(callback(&mut window, &mut syncs));
+}
+
+/// An enable while no text input is entered owes the opening, and the first `enter` pays it: the
+/// `enter`'s own `Ime::Enabled` is the opening, and no callback pushes another.
+#[test]
+fn an_enable_with_no_member_opens_at_the_enter() {
+    let a = Fake::default();
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    assert!(!callback(&mut window, &mut syncs), "no member: nothing opens");
+    assert!(window.enter(&a));
+    assert!(!window.take_opening(), "the `enter` paid the opening");
+}
+
+/// An update of the state is no transition: it sends the state with its commit, and no sync.
+#[test]
+fn an_update_sends_no_sync() {
+    let a = Fake::default();
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    window.enter(&a);
+    syncs.clear();
+    a.requests();
+
+    let update = ImeRequestData::default().with_cursor_area(
+        dpi::Position::Logical(dpi::LogicalPosition::new(30.0, 20.0)),
+        dpi::Size::Logical(dpi::LogicalSize::new(1.0, 16.0)),
+    );
+    assert_eq!(request(&mut window, &mut syncs, ImeRequest::Update(update)), None);
+    assert_eq!(a.requests(), ["cursor_rectangle", "commit"]);
+    assert!(syncs.is_empty());
+}
+
+/// A compositor that answers every batch with `done(0)` — no count of commits at all — loses only
+/// what it sends while a fence stands: every `done` is behind the fence and dropped until the
+/// disable's callback retires it, one round trip after the disable, and every `done` after the
+/// callback is delivered. The window opens at that callback, as with a conforming compositor.
+#[test]
+fn a_compositor_answering_done_zero_loses_only_the_batches_sent_while_fenced() {
+    let a = Fake::default();
+    let (mut window, mut syncs) = (ImeWindow::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    window.enter(&a);
+    syncs.clear();
+    assert!(a.with_data(|data| data.admit_done(0)), "no fence: `done(0)` is delivered");
+
+    reset(&mut window, &mut syncs);
+    assert!(!a.with_data(|data| data.admit_done(0)), "while fenced, `done(0)` is behind the fence");
+    assert!(!a.with_data(|data| data.admit_done(0)), "however many come");
+
+    assert!(callback(&mut window, &mut syncs), "the disable's callback retires it and opens");
+    assert!(a.with_data(|data| data.admit_done(0)), "after the callback `done(0)` is delivered");
 }

@@ -3,6 +3,8 @@ use std::ops::Deref;
 use dpi::{LogicalPosition, LogicalSize};
 use sctk::globals::GlobalData;
 use sctk::reexports::client::globals::{BindError, GlobalList};
+use sctk::reexports::client::protocol::wl_callback::{self, WlCallback};
+use sctk::reexports::client::protocol::wl_display::WlDisplay;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Dispatch, Proxy, QueueHandle, delegate_dispatch};
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
@@ -16,6 +18,10 @@ use winit_core::window::{
 };
 
 use crate::state::WinitState;
+
+mod window;
+
+pub use window::ImeWindow;
 
 #[derive(Debug)]
 pub struct TextInputState {
@@ -58,11 +64,11 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
         text_input: &ZwpTextInputV3,
         event: <ZwpTextInputV3 as Proxy>::Event,
         data: &TextInputData,
-        _conn: &Connection,
-        _qhandle: &QueueHandle<WinitState>,
+        conn: &Connection,
+        qhandle: &QueueHandle<WinitState>,
     ) {
         // A window's state is locked before the data of a text input, here as where a request
-        // applies the window's state to its text inputs (`ZwpTextInputV3Ext::set_state`).
+        // applies the window's state to its text inputs (`ImeWindow::request`).
         let windows = state.windows.get_mut();
         match event {
             TextInputEvent::Enter { surface } => {
@@ -74,36 +80,33 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                     None => return,
                 };
 
-                if let Some(text_input_state) = window.text_input_state() {
-                    text_input.set_state(Some(text_input_state), true);
+                if window.text_input_entered(text_input) {
                     // The input method doesn't have to reply anything, so a synthetic event
                     // carrying an empty state notifies the application about its presence.
                     state.events_sink.push_window_event(WindowEvent::Ime(Ime::Enabled), window_id);
                 }
-
-                window.text_input_entered(text_input);
             },
             TextInputEvent::Leave { surface } => {
-                let window_id = crate::make_wid(&surface);
-                let window = windows.get(&window_id).map(|window| window.lock().unwrap());
-
-                {
+                let fence = {
                     let mut text_input_data = data.inner.lock().unwrap();
                     text_input_data.surface = None;
                     // Always issue a disable.
-                    text_input_data.disable(text_input);
-                }
+                    text_input_data.disable(text_input)
+                };
+                ImeSync::send(&conn.display(), qhandle, vec![(text_input.clone(), fence)]);
+
+                let window_id = crate::make_wid(&surface);
 
                 // XXX this check is essential, because `leave` could have a
                 // reference to nil surface...
-                let mut window = match window {
-                    Some(window) => window,
+                match windows.get(&window_id) {
+                    Some(window) => window.lock().unwrap().text_input_left(text_input),
                     None => return,
-                };
-
-                window.text_input_left(text_input);
+                }
 
                 state.events_sink.push_window_event(WindowEvent::Ime(Ime::Disabled), window_id);
+                // The window may be owed its opening, which waited for this text input too.
+                state.open_ime_windows();
             },
             TextInputEvent::PreeditString { text, cursor_begin, cursor_end } => {
                 data.inner.lock().unwrap().preedit_string(text, cursor_begin, cursor_end)
@@ -148,22 +151,82 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
     }
 }
 
-pub trait ZwpTextInputV3Ext {
-    /// Applies the entire state atomically to the input method. It will skip the "enable" request
-    /// if `already_enabled` is `true`.
-    fn set_state(&self, state: Option<&ClientState>, send_enable: bool);
+/// The `wl_display.sync` of one input method transition: an application's disable or enable of a
+/// window's input method, or a text input's `leave`.
+///
+/// The compositor handles a connection's requests in order and sends a connection's events in
+/// order, so the callback follows every event the compositor sent before it applied the requests
+/// ahead of the sync: every batch a listed text input's compositor-side state produced before its
+/// disable. The callback retires those fences — each only if no later disable replaced it — and
+/// opens the windows whose text inputs are all ready (`ImeWindow::take_opening`).
+#[derive(Debug)]
+pub struct ImeSync {
+    /// The text inputs the transition disabled, each with its fence.
+    fences: Vec<(ZwpTextInputV3, u32)>,
 }
 
-impl ZwpTextInputV3Ext for ZwpTextInputV3 {
-    fn set_state(&self, state: Option<&ClientState>, send_enable: bool) {
+impl ImeSync {
+    /// Sends the sync of a transition that disabled the `fences`' text inputs (none for an
+    /// enable).
+    pub fn send(
+        display: &WlDisplay,
+        queue_handle: &QueueHandle<WinitState>,
+        fences: Vec<(ZwpTextInputV3, u32)>,
+    ) {
+        display.sync(queue_handle, ImeSync { fences });
+    }
+}
+
+impl Dispatch<WlCallback, ImeSync, WinitState> for TextInputState {
+    fn event(
+        state: &mut WinitState,
+        _callback: &WlCallback,
+        event: <WlCallback as Proxy>::Event,
+        data: &ImeSync,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<WinitState>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            retire(&data.fences);
+            state.open_ime_windows();
+        }
+    }
+}
+
+/// Retires the fences a transition's sync lists: each listed text input that is still alive and
+/// whose fence is still the listed one. A later disable's fence stays for its own sync.
+fn retire<T: TextInputHandle>(fences: &[(T, u32)]) {
+    for (text_input, fence) in fences {
+        if text_input.is_alive() {
+            text_input.with_data(|data| data.retire(*fence));
+        }
+    }
+}
+
+/// A text input as a window's input method holds it: its requests, and its data.
+pub(crate) trait TextInputHandle: TextInputRequests + Clone + PartialEq {
+    /// Runs `f` on the text input's data. The caller holds no other text input's data, and a
+    /// window's state is locked before a text input's data.
+    fn with_data<R>(&self, f: impl FnOnce(&mut TextInputDataInner) -> R) -> R;
+
+    /// Whether the text input is still alive; a destroyed one is never retired by a sync.
+    fn is_alive(&self) -> bool;
+}
+
+impl TextInputHandle for ZwpTextInputV3 {
+    fn with_data<R>(&self, f: impl FnOnce(&mut TextInputDataInner) -> R) -> R {
         let data = self.data::<TextInputData>().expect("a text input carries its data");
-        data.inner.lock().unwrap().set_state(self, state, send_enable);
+        f(&mut data.inner.lock().unwrap())
+    }
+
+    fn is_alive(&self) -> bool {
+        Proxy::is_alive(self)
     }
 }
 
 /// The requests that change a text input's state. winit issues them through
 /// [`TextInputDataInner`], which counts every `commit`; the unit tests record them.
-trait TextInputRequests {
+pub(crate) trait TextInputRequests {
     fn enable(&self);
     fn disable(&self);
     fn set_content_type(&self, hint: ContentHint, purpose: ContentPurpose);
@@ -252,22 +315,15 @@ impl Default for TextInputDataInner {
 }
 
 impl TextInputDataInner {
-    /// Applies the window's input method state to `text_input` atomically: `None` disables it;
-    /// otherwise the state is sent, after an `enable` when `send_enable`.
+    /// Applies the window's input method state to `text_input` atomically: the state is sent, after
+    /// an `enable` when `send_enable`. A text input is disabled by [`Self::disable`] alone, whose
+    /// fence the caller hands to a sync.
     fn set_state(
         &mut self,
         text_input: &impl TextInputRequests,
-        state: Option<&ClientState>,
+        state: &ClientState,
         send_enable: bool,
     ) {
-        let state = match state {
-            Some(state) => state,
-            None => {
-                self.disable(text_input);
-                return;
-            },
-        };
-
         if send_enable {
             text_input.enable();
         }
@@ -302,12 +358,30 @@ impl TextInputDataInner {
     /// it computed before then belongs to the state the disable ended. The commit's serial is
     /// the fence that tells them apart: a `done` whose serial precedes it is one of them. The
     /// batch pending now is one of them too, and the preedit is gone with the state.
-    fn disable(&mut self, text_input: &impl TextInputRequests) {
+    ///
+    /// Returns the fence. A sync must list it: only its callback, or a `done` at or past it,
+    /// retires it, and a window does not open while one of its text inputs is fenced.
+    #[must_use = "the fence is retired only by a sync that lists it"]
+    fn disable(&mut self, text_input: &impl TextInputRequests) -> u32 {
         text_input.disable();
         let serial = self.commit(text_input);
         self.fence = Some(serial);
         self.discard_pending();
         self.last_preedit_empty = true;
+        serial
+    }
+
+    /// Retires `fence` at its sync's callback, unless a later disable replaced it: every batch the
+    /// compositor computed before it applied that disable has arrived, and was dropped.
+    fn retire(&mut self, fence: u32) {
+        if self.fence == Some(fence) {
+            self.fence = None;
+        }
+    }
+
+    /// Whether the text input waits for the retirement of a disable's fence.
+    fn fenced(&self) -> bool {
+        self.fence.is_some()
     }
 
     /// Issues `commit` on `text_input` and counts it, returning its serial: the serial of the
@@ -626,6 +700,7 @@ impl Default for ContentType {
 
 delegate_dispatch!(WinitState: [ZwpTextInputManagerV3: GlobalData] => TextInputState);
 delegate_dispatch!(WinitState: [ZwpTextInputV3: TextInputData] => TextInputState);
+delegate_dispatch!(WinitState: [WlCallback: ImeSync] => TextInputState);
 
 #[cfg(test)]
 mod tests;

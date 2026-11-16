@@ -34,10 +34,8 @@ pub use pointer::pointer_gesture::{PointerGestureData, PointerGesturesState};
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 use text_input::TextInputData;
-pub use text_input::{ClientState as TextInputClientState, TextInputState};
+pub use text_input::{ClientState as TextInputClientState, ImeSync, ImeWindow, TextInputState};
 use touch::TouchPoint;
-
-pub(crate) use crate::seat::text_input::ZwpTextInputV3Ext;
 
 #[derive(Debug, Default)]
 pub struct WinitSeatState {

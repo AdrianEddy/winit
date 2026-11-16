@@ -15,6 +15,7 @@ use winit_core::window::{
     UserAttentionType, WindowId, WindowLevel,
 };
 
+use crate::seat::ImeSync;
 use crate::window::Handles;
 use crate::window::state::WindowState;
 
@@ -190,11 +191,21 @@ impl WindowCommon {
     #[inline]
     pub(crate) fn request_ime_update(&self, request: ImeRequest) -> Result<(), ImeRequestError> {
         let Some(s) = self.state.upgrade() else { return Ok(()) };
-        let state_changed = s.lock().unwrap().request_ime_update(request)?;
+        let state_changed = s.lock().unwrap().request_ime_update(request, |fences| {
+            ImeSync::send(&self.display, &self.handles.queue_handle, fences)
+        })?;
 
-        if let Some(allowed) = state_changed {
-            let event = WindowEvent::Ime(if allowed { Ime::Enabled } else { Ime::Disabled });
-            self.handles.push_window_event(event, self.window_id);
+        // The `Ime::Enabled` of an enable is the window's opening, which the compositor's dispatch
+        // pushes once every batch from before the window's latest disables has arrived. Pushed
+        // here, into the window's own sink, it would be delivered ahead of the compositor's events
+        // already received in this iteration.
+        match state_changed {
+            Some(false) => {
+                self.handles.push_window_event(WindowEvent::Ime(Ime::Disabled), self.window_id)
+            },
+            // Wake the loop, which flushes the requests and dispatches the sync's callback.
+            Some(true) => self.handles.event_loop_awakener.ping(),
+            None => (),
         }
 
         Ok(())
