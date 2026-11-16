@@ -2024,6 +2024,26 @@ pub enum ImeRequest {
     ///
     /// **The disable request can not fail**.
     Disable,
+    /// Discard the composition the IME shows, without committing it.
+    ///
+    /// The IME drops its preedit, and nothing of it is delivered as an [`Ime::Commit`]: neither
+    /// what the IME sends back while handling the request, nor a commit that the dropped
+    /// composition would have made later. An [`Ime::Preedit`] with an empty string and no cursor
+    /// ends the request, whether or not there was a preedit: every event delivered before it
+    /// belongs to the dropped composition. The IME stays enabled with its capabilities and data.
+    ///
+    /// Use it when the application resolved the composition itself, for example by committing or
+    /// removing the preedit text, so that the IME does not go on composing it. Issuing this
+    /// request before [`ImeRequest::Enable`] will result in error.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **macOS**: the view's input context discards its marked text.
+    /// - **Others**: Unsupported.
+    ///
+    /// [`Ime::Commit`]: crate::event::Ime::Commit
+    /// [`Ime::Preedit`]: crate::event::Ime::Preedit
+    Discard,
 }
 
 /// Initial IME request.

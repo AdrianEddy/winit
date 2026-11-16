@@ -143,6 +143,12 @@ pub struct ViewState {
     forward_key_to_app: Cell<bool>,
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
 
+    /// True while the view's input context discards its marked text (`discard_marked_text`).
+    ///
+    /// What the input method sends back during that call (`setMarkedText:`, `insertText:`,
+    /// `unmarkText`) belongs to the composition being discarded, so it is ignored.
+    discarding_marked_text: Cell<bool>,
+
     /// Set by `acceptsFirstMouse:` so the next `mouseDown:` can tag its
     /// [`WindowEvent::PointerButton`] with `is_macos_activation_click: true`.
     next_click_is_activation: Cell<bool>,
@@ -271,6 +277,12 @@ define_class!(
             // TODO: Use _replacement_range, requires changing the event to report surrounding text.
             let _entered = debug_span!("setMarkedText:selectedRange:replacementRange:").entered();
 
+            if self.ivars().discarding_marked_text.get() {
+                // The input method's answer to the discard of this very composition.
+                tracing::debug!("ignoring setMarkedText: sent while the marked text is discarded");
+                return;
+            }
+
             let (marked_text, string) = if let Some(string) =
                 string.downcast_ref::<NSAttributedString>()
             {
@@ -324,6 +336,11 @@ define_class!(
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
             let _entered = debug_span!("unmarkText").entered();
+            if self.ivars().discarding_marked_text.get() {
+                // The input method's answer to the discard of this very composition.
+                tracing::debug!("ignoring unmarkText sent while the marked text is discarded");
+                return;
+            }
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
             let input_context = self.inputContext().expect("input context");
@@ -386,6 +403,13 @@ define_class!(
         fn insert_text(&self, string: &NSObject, _replacement_range: NSRange) {
             // TODO: Use _replacement_range, requires changing the event to report surrounding text.
             let _entered = debug_span!("insertText:replacementRange:").entered();
+
+            if self.ivars().discarding_marked_text.get() {
+                // The input method's answer to the discard of this very composition: committing
+                // it would deliver the text the application asked to drop.
+                tracing::debug!("ignoring insertText: sent while the marked text is discarded");
+                return;
+            }
 
             let string = if let Some(string) = string.downcast_ref::<NSAttributedString>() {
                 string.string().to_string()
@@ -876,6 +900,7 @@ impl WinitView {
             ime_capabilities: Default::default(),
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
+            discarding_marked_text: Default::default(),
             next_click_is_activation: Default::default(),
             option_as_alt: Cell::new(option_as_alt),
         });
@@ -1036,9 +1061,7 @@ impl WinitView {
         // marked text and continues composing it once IME is enabled again (e.g. when focus
         // returns to a text input), even though the application has already ended it.
         if self.ivars().marked_text.borrow().length() > 0 {
-            if let Some(input_context) = self.inputContext() {
-                input_context.discardMarkedText();
-            }
+            self.discard_marked_text();
         }
         // see above
         self.ivars().ime_capabilities.set(None);
@@ -1050,6 +1073,44 @@ impl WinitView {
         // `set_ime_allowed`
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
         self.ivars().pending_commit.set(false);
+    }
+
+    /// Drop the composition the input method shows, without committing it
+    /// (`ImeRequest::Discard`).
+    ///
+    /// The input method discards its marked text, and nothing it sends back meanwhile is
+    /// delivered. The view then holds no marked text and no pending commit, so a later
+    /// `insertText:` is a commit only after a new composition, and the next key press is not
+    /// taken for the end of one. An `Ime::Preedit("", None)` ends the request: every event the
+    /// application received before it belongs to the dropped composition.
+    pub(super) fn discard_ime(&self) {
+        if self.ivars().marked_text.borrow().length() > 0 {
+            self.discard_marked_text();
+        }
+        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+        self.ivars().pending_commit.set(false);
+        if self.is_ime_enabled() {
+            self.ivars().ime_state.set(ImeState::Ground);
+        }
+        self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+    }
+
+    /// Tell the view's input context to discard its marked text, and ignore what the input
+    /// method sends back during the call: it belongs to the composition being discarded.
+    fn discard_marked_text(&self) {
+        let Some(input_context) = self.inputContext() else {
+            return;
+        };
+        struct Discarding<'a>(&'a Cell<bool>);
+        impl Drop for Discarding<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let flag = &self.ivars().discarding_marked_text;
+        flag.set(true);
+        let _discarding = Discarding(flag);
+        input_context.discardMarkedText();
     }
 
     pub(super) fn ime_capabilities(&self) -> Option<ImeCapabilities> {

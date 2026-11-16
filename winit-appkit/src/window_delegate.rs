@@ -2107,6 +2107,13 @@ impl WindowDelegate {
                 self.view().disable_ime();
                 return Ok(());
             },
+            ImeRequest::Discard => {
+                if current_caps.is_none() {
+                    return Err(ImeRequestError::NotEnabled);
+                }
+                self.view().discard_ime();
+                return Ok(());
+            },
             _ => return Err(ImeRequestError::NotSupported),
         };
 
