@@ -61,12 +61,13 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
         _conn: &Connection,
         _qhandle: &QueueHandle<WinitState>,
     ) {
+        // A window's state is locked before the data of a text input, here as where a request
+        // applies the window's state to its text inputs (`ZwpTextInputV3Ext::set_state`).
         let windows = state.windows.get_mut();
-        let mut text_input_data = data.inner.lock().unwrap();
         match event {
             TextInputEvent::Enter { surface } => {
                 let window_id = crate::make_wid(&surface);
-                text_input_data.surface = Some(surface);
+                data.inner.lock().unwrap().surface = Some(surface);
 
                 let mut window = match windows.get(&window_id) {
                     Some(window) => window.lock().unwrap(),
@@ -83,19 +84,20 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 window.text_input_entered(text_input);
             },
             TextInputEvent::Leave { surface } => {
-                text_input_data.surface = None;
-                text_input_data.last_preedit_empty = true;
-
-                // Always issue a disable.
-                text_input.disable();
-                text_input.commit();
-
                 let window_id = crate::make_wid(&surface);
+                let window = windows.get(&window_id).map(|window| window.lock().unwrap());
+
+                {
+                    let mut text_input_data = data.inner.lock().unwrap();
+                    text_input_data.surface = None;
+                    // Always issue a disable.
+                    text_input_data.disable(text_input);
+                }
 
                 // XXX this check is essential, because `leave` could have a
                 // reference to nil surface...
-                let mut window = match windows.get(&window_id) {
-                    Some(window) => window.lock().unwrap(),
+                let mut window = match window {
+                    Some(window) => window,
                     None => return,
                 };
 
@@ -104,21 +106,31 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 state.events_sink.push_window_event(WindowEvent::Ime(Ime::Disabled), window_id);
             },
             TextInputEvent::PreeditString { text, cursor_begin, cursor_end } => {
-                text_input_data.preedit_string(text, cursor_begin, cursor_end)
+                data.inner.lock().unwrap().preedit_string(text, cursor_begin, cursor_end)
             },
-            TextInputEvent::CommitString { text } => text_input_data.commit_string(text),
+            TextInputEvent::CommitString { text } => data.inner.lock().unwrap().commit_string(text),
             TextInputEvent::DeleteSurroundingText { before_length, after_length } => {
-                text_input_data.delete_surrounding_text(before_length, after_length)
+                data.inner.lock().unwrap().delete_surrounding_text(before_length, after_length)
             },
-            TextInputEvent::Done { .. } => {
+            TextInputEvent::Done { serial } => {
+                let window_id = data.inner.lock().unwrap().surface.as_ref().map(crate::make_wid);
+                let window = window_id
+                    .and_then(|window_id| windows.get(&window_id))
+                    .map(|window| window.lock().unwrap());
+                let mut text_input_data = data.inner.lock().unwrap();
+
+                // A batch the compositor computed before it applied the latest disable belongs to
+                // the input method state that disable ended.
+                if !text_input_data.admit_done(serial) {
+                    text_input_data.discard_pending();
+                    return;
+                }
+
                 // The window this `done` delivers to, if any: none without a surface, and none for
                 // a window whose IME is disabled, in case some IME sends events for it.
-                let target =
-                    text_input_data.surface.as_ref().map(crate::make_wid).filter(|window_id| {
-                        windows.get(window_id).is_none_or(|window| {
-                            window.lock().unwrap().text_input_state().is_some()
-                        })
-                    });
+                let target = window_id.filter(|_| {
+                    window.as_ref().is_none_or(|window| window.text_input_state().is_some())
+                });
 
                 // text-input-v3 resets the pending state at every `done`, so a `done` that delivers
                 // to no window discards it rather than leaving it for the next `done`.
@@ -144,41 +156,52 @@ pub trait ZwpTextInputV3Ext {
 
 impl ZwpTextInputV3Ext for ZwpTextInputV3 {
     fn set_state(&self, state: Option<&ClientState>, send_enable: bool) {
-        let state = match state {
-            Some(state) => state,
-            None => {
-                self.disable();
-                self.commit();
-                return;
-            },
-        };
+        let data = self.data::<TextInputData>().expect("a text input carries its data");
+        data.inner.lock().unwrap().set_state(self, state, send_enable);
+    }
+}
 
-        if send_enable {
-            self.enable();
-        }
+/// The requests that change a text input's state. winit issues them through
+/// [`TextInputDataInner`], which counts every `commit`; the unit tests record them.
+trait TextInputRequests {
+    fn enable(&self);
+    fn disable(&self);
+    fn set_content_type(&self, hint: ContentHint, purpose: ContentPurpose);
+    fn set_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32);
+    fn set_surrounding_text(&self, text: String, cursor: i32, anchor: i32);
+    /// The `commit` request, not counted: only [`TextInputDataInner::commit`] sends it, and counts
+    /// it. An uncounted commit would put the compositor's serials ahead of the count, and let a
+    /// batch from before a disable through the fence.
+    fn commit_uncounted(&self);
+}
 
-        if let Some(content_type) = state.content_type() {
-            self.set_content_type(content_type.hint, content_type.purpose);
-        }
+impl TextInputRequests for ZwpTextInputV3 {
+    fn enable(&self) {
+        ZwpTextInputV3::enable(self)
+    }
 
-        if let Some((position, size)) = state.cursor_area() {
-            let (x, y) = (position.x as i32, position.y as i32);
-            let (width, height) = (size.width as i32, size.height as i32);
-            // The same cursor can be applied on different seats.
-            // It's the compositor's responsibility to make sure that any present popups don't
-            // overlap.
-            self.set_cursor_rectangle(x, y, width, height);
-        }
+    fn disable(&self) {
+        ZwpTextInputV3::disable(self)
+    }
 
-        if let Some(surrounding) = state.surrounding_text() {
-            self.set_surrounding_text(
-                surrounding.text().into(),
-                surrounding.cursor() as i32,
-                surrounding.anchor() as i32,
-            );
-        }
+    fn set_content_type(&self, hint: ContentHint, purpose: ContentPurpose) {
+        ZwpTextInputV3::set_content_type(self, hint, purpose)
+    }
 
-        self.commit();
+    fn set_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32) {
+        ZwpTextInputV3::set_cursor_rectangle(self, x, y, width, height)
+    }
+
+    fn set_surrounding_text(&self, text: String, cursor: i32, anchor: i32) {
+        ZwpTextInputV3::set_surrounding_text(self, text, cursor, anchor)
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one forwarding of the request, counted by `TextInputDataInner::commit`"
+    )]
+    fn commit_uncounted(&self) {
+        ZwpTextInputV3::commit(self)
     }
 }
 
@@ -203,6 +226,15 @@ pub struct TextInputDataInner {
 
     /// Last preedit empty.
     last_preedit_empty: bool,
+
+    /// The number of `commit` requests issued on the text input, wrapping. text-input-v3: "The
+    /// compositor must count the number of commit requests coming from each zwp_text_input_v3
+    /// object and use the count as the serial in done events."
+    commits: u32,
+
+    /// The serial of the latest commit that disabled the text input, until a `done` at or past it
+    /// shows that the compositor has sent every batch it computed before it applied that disable.
+    fence: Option<u32>,
 }
 
 impl Default for TextInputDataInner {
@@ -213,11 +245,96 @@ impl Default for TextInputDataInner {
             pending_preedit: None,
             pending_delete: None,
             last_preedit_empty: true,
+            commits: 0,
+            fence: None,
         }
     }
 }
 
 impl TextInputDataInner {
+    /// Applies the window's input method state to `text_input` atomically: `None` disables it;
+    /// otherwise the state is sent, after an `enable` when `send_enable`.
+    fn set_state(
+        &mut self,
+        text_input: &impl TextInputRequests,
+        state: Option<&ClientState>,
+        send_enable: bool,
+    ) {
+        let state = match state {
+            Some(state) => state,
+            None => {
+                self.disable(text_input);
+                return;
+            },
+        };
+
+        if send_enable {
+            text_input.enable();
+        }
+
+        if let Some(content_type) = state.content_type() {
+            text_input.set_content_type(content_type.hint, content_type.purpose);
+        }
+
+        if let Some((position, size)) = state.cursor_area() {
+            let (x, y) = (position.x as i32, position.y as i32);
+            let (width, height) = (size.width as i32, size.height as i32);
+            // The same cursor can be applied on different seats.
+            // It's the compositor's responsibility to make sure that any present popups don't
+            // overlap.
+            text_input.set_cursor_rectangle(x, y, width, height);
+        }
+
+        if let Some(surrounding) = state.surrounding_text() {
+            text_input.set_surrounding_text(
+                surrounding.text().into(),
+                surrounding.cursor() as i32,
+                surrounding.anchor() as i32,
+            );
+        }
+
+        self.commit(text_input);
+    }
+
+    /// Disables `text_input`: `disable`, then its `commit`.
+    ///
+    /// The compositor resets the text input's state when it applies the disable, so every batch
+    /// it computed before then belongs to the state the disable ended. The commit's serial is
+    /// the fence that tells them apart: a `done` whose serial precedes it is one of them. The
+    /// batch pending now is one of them too, and the preedit is gone with the state.
+    fn disable(&mut self, text_input: &impl TextInputRequests) {
+        text_input.disable();
+        let serial = self.commit(text_input);
+        self.fence = Some(serial);
+        self.discard_pending();
+        self.last_preedit_empty = true;
+    }
+
+    /// Issues `commit` on `text_input` and counts it, returning its serial: the serial of the
+    /// first `done` the compositor sends after it applied the commit.
+    fn commit(&mut self, text_input: &impl TextInputRequests) -> u32 {
+        text_input.commit_uncounted();
+        self.commits = self.commits.wrapping_add(1);
+        self.commits
+    }
+
+    /// Whether a `done` carrying `serial` delivers its batch: not when the compositor computed the
+    /// batch before it applied the latest disable, however late the `done` arrives. A `done` at or
+    /// past the fence retires it: the compositor sends its events in order, so every older batch
+    /// has arrived already.
+    ///
+    /// text-input-v3 asks a client to apply a batch whose serial does not match its count of
+    /// commits "as normal"; a batch from before a disable is the exception, as the state it was
+    /// computed for no longer exists. Serials are compared wrapping, which is exact while fewer
+    /// than 2^31 commits separate a batch from the fence.
+    fn admit_done(&mut self, serial: u32) -> bool {
+        let Some(fence) = self.fence else { return true };
+        if (serial.wrapping_sub(fence) as i32) < 0 {
+            return false;
+        }
+        self.fence = None;
+        true
+    }
     /// A `preedit_string` event: the batch's new preedit.
     fn preedit_string(&mut self, text: Option<String>, cursor_begin: i32, cursor_end: i32) {
         self.pending_preedit = Some(Preedit::from_event(text, cursor_begin, cursor_end));

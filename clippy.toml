@@ -24,4 +24,5 @@ disallowed-methods = [
     { allow-invalid = true, path = "web_sys::Window::get_computed_style", reason = "cache this to reduce calls to JS" },
     { allow-invalid = true, path = "web_sys::Window::navigator", reason = "cache this to reduce calls to JS" },
     { allow-invalid = true, path = "web_sys::window", reason = "is not available in every context" },
+    { allow-invalid = true, path = "wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3::commit", reason = "every commit on a text input is counted, for the serial of its `done` events: use `TextInputDataInner::commit`" },
 ]

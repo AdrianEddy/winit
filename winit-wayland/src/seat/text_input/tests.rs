@@ -178,3 +178,180 @@ fn a_delete_only_batch_ends_with_an_empty_preedit() {
         Ime::Preedit("y".to_owned(), Some((1, 1))),
     ]);
 }
+
+/// The requests issued on a text input, in order.
+#[derive(Default)]
+struct Requests(std::cell::RefCell<Vec<&'static str>>);
+
+impl Requests {
+    fn take(&self) -> Vec<&'static str> {
+        std::mem::take(&mut self.0.borrow_mut())
+    }
+}
+
+impl TextInputRequests for Requests {
+    fn enable(&self) {
+        self.0.borrow_mut().push("enable");
+    }
+
+    fn disable(&self) {
+        self.0.borrow_mut().push("disable");
+    }
+
+    fn set_content_type(&self, _: ContentHint, _: ContentPurpose) {
+        self.0.borrow_mut().push("content_type");
+    }
+
+    fn set_cursor_rectangle(&self, _: i32, _: i32, _: i32, _: i32) {
+        self.0.borrow_mut().push("cursor_rectangle");
+    }
+
+    fn set_surrounding_text(&self, _: String, _: i32, _: i32) {
+        self.0.borrow_mut().push("surrounding_text");
+    }
+
+    fn commit_uncounted(&self) {
+        self.0.borrow_mut().push("commit");
+    }
+}
+
+/// A window's input method state with a cursor area.
+fn client_state() -> ClientState {
+    let request_data = ImeRequestData::default().with_cursor_area(
+        dpi::Position::Logical(dpi::LogicalPosition::new(10.0, 20.0)),
+        dpi::Size::Logical(dpi::LogicalSize::new(1.0, 16.0)),
+    );
+    ClientState::new(ImeCapabilities::new().with_cursor_area(), request_data, 1.0)
+}
+
+/// An application ends a composition by disabling the input method and enabling it again. A
+/// batch the compositor computed before it applied the disable can arrive after the re-enable:
+/// its `done` carries a serial before the disable's commit, and is dropped with its batch. The
+/// first `done` at the disable's serial is kept, and so is every later one.
+#[test]
+fn a_done_from_before_the_disable_is_dropped_after_the_re_enable() {
+    let text_input = Requests::default();
+    let mut data = TextInputDataInner::default();
+    data.set_state(&text_input, Some(&client_state()), true);
+    data.preedit_string(Some("ab".to_owned()), 2, 2);
+    assert!(data.admit_done(1));
+    assert_eq!(done(&mut data), [Ime::Preedit("ab".to_owned(), Some((2, 2)))]);
+
+    // The application's reset: the disable is the second commit, the re-enable the third.
+    data.set_state(&text_input, None, false);
+    data.set_state(&text_input, Some(&client_state()), true);
+    let fence = 2;
+    assert_eq!(data.fence, Some(fence));
+
+    // The input method's commit of "ab", which the compositor sent before it applied the disable.
+    data.commit_string(Some("ab".to_owned()));
+    assert!(!data.admit_done(fence - 1), "a batch from before the disable is dropped");
+    data.discard_pending();
+    data.commit_string(Some("ab".to_owned()));
+    assert!(!data.admit_done(fence - 1), "however many arrive");
+    data.discard_pending();
+
+    data.preedit_string(Some("x".to_owned()), 1, 1);
+    assert!(data.admit_done(fence), "the disable's own serial is past the old state");
+    assert_eq!(done(&mut data), [Ime::Preedit("x".to_owned(), Some((1, 1)))]);
+    assert_eq!(data.fence, None, "a `done` at the fence retires it");
+    assert!(data.admit_done(fence + 1));
+}
+
+/// Every `commit` is counted, from every request that sends one: the disable, the enable with the
+/// state, and an update of the state alone. A disable also discards the pending batch and the
+/// shown preedit, which the compositor resets with the state.
+#[test]
+fn every_commit_is_counted_and_each_disable_sets_the_fence() {
+    let text_input = Requests::default();
+    let mut data = TextInputDataInner::default();
+
+    data.set_state(&text_input, Some(&client_state()), true);
+    assert_eq!(text_input.take(), ["enable", "cursor_rectangle", "commit"]);
+    data.set_state(&text_input, Some(&client_state()), false);
+    assert_eq!(text_input.take(), ["cursor_rectangle", "commit"]);
+    assert_eq!((data.commits, data.fence), (2, None));
+
+    data.preedit_string(Some("ab".to_owned()), 2, 2);
+    assert!(data.admit_done(2));
+    assert_eq!(done(&mut data), [Ime::Preedit("ab".to_owned(), Some((2, 2)))]);
+    data.commit_string(Some("pending".to_owned()));
+    data.set_state(&text_input, None, false);
+    assert_eq!(text_input.take(), ["disable", "commit"]);
+    assert_eq!((data.commits, data.fence), (3, Some(3)));
+
+    // What the disable reset is gone: no pending commit, and no preedit left to clear.
+    assert!(data.admit_done(3));
+    assert!(done(&mut data).is_empty());
+
+    // `leave` disables through the same method.
+    data.disable(&text_input);
+    assert_eq!(text_input.take(), ["disable", "commit"]);
+    assert_eq!((data.commits, data.fence), (4, Some(4)));
+}
+
+/// Several resets before any `done`: the fence is the latest disable's. A batch the compositor
+/// computed between the first re-enable and the second disable is dropped too: it was computed for
+/// a state the second disable ended.
+#[test]
+fn the_fence_is_the_latest_disable() {
+    let text_input = Requests::default();
+    let mut data = TextInputDataInner::default();
+    for _ in 0..2 {
+        data.set_state(&text_input, None, false);
+        data.set_state(&text_input, Some(&client_state()), true);
+    }
+    assert_eq!((data.commits, data.fence), (4, Some(3)));
+    assert!(!data.admit_done(1));
+    assert!(!data.admit_done(2), "computed after the first re-enable, before the second disable");
+    assert!(data.admit_done(3));
+}
+
+/// A `leave` disables the text input and fences it; an `enter` enables it again with the window's
+/// state and leaves the fence standing: a batch the compositor computed before the `leave`'s
+/// disable is still dropped after the `enter`, and the first `done` at the fence is kept.
+#[test]
+fn an_enter_while_fenced_keeps_dropping_the_batches_from_before_the_disable() {
+    let text_input = Requests::default();
+    let mut data = TextInputDataInner::default();
+    data.set_state(&text_input, Some(&client_state()), true);
+    data.disable(&text_input);
+    let fence = data.commits;
+    data.set_state(&text_input, Some(&client_state()), true);
+    assert_eq!(text_input.take(), [
+        "enable",
+        "cursor_rectangle",
+        "commit",
+        "disable",
+        "commit",
+        "enable",
+        "cursor_rectangle",
+        "commit",
+    ]);
+    assert_eq!(data.fence, Some(fence), "the `enter` leaves the fence");
+
+    data.commit_string(Some("stale".to_owned()));
+    assert!(!data.admit_done(fence - 1), "computed before the disable");
+    data.discard_pending();
+    assert!(data.admit_done(fence));
+    assert_eq!(data.fence, None);
+}
+
+/// The count wraps, and so does the comparison: a fence at `u32::MAX` drops the serials before it
+/// and keeps the ones after it, past zero.
+#[test]
+fn the_fence_compares_wrapping() {
+    let text_input = Requests::default();
+    let mut data = TextInputDataInner { commits: u32::MAX - 1, ..TextInputDataInner::default() };
+    data.set_state(&text_input, None, false);
+    data.set_state(&text_input, Some(&client_state()), true);
+    assert_eq!((data.commits, data.fence), (0, Some(u32::MAX)));
+    assert!(!data.admit_done(u32::MAX - 1));
+    assert!(!data.admit_done(u32::MAX - 2));
+    assert!(data.admit_done(0), "past the fence, wrapped");
+    assert_eq!(data.fence, None);
+
+    let mut data = TextInputDataInner { commits: u32::MAX - 1, ..TextInputDataInner::default() };
+    data.set_state(&text_input, None, false);
+    assert!(data.admit_done(u32::MAX), "the fence's own serial");
+}
