@@ -432,8 +432,21 @@ impl TextInputHandle for Fake {
     }
 }
 
-/// The syncs a window's requests send, in order, each as the fences it lists.
-type Syncs = Vec<Vec<(Fake, u32)>>;
+/// One sync a window's requests send: the fences it lists, and the `Ime::Disabled` it owes the
+/// window (a disable's).
+#[derive(Debug, PartialEq)]
+struct Sync {
+    fences: Vec<(Fake, u32)>,
+    disabled: Option<OwedDisabled>,
+}
+
+/// The syncs a window's requests send, in order.
+type Syncs = Vec<Sync>;
+
+/// The sync of a takeover's native reset, which owes the window nothing.
+fn reset_sync(syncs: &mut Syncs) -> impl FnOnce(Vec<(Fake, u32)>) + '_ {
+    |fences| syncs.push(Sync { fences, disabled: None })
+}
 
 fn enable() -> ImeRequest {
     let request_data = ImeRequestData::default().with_cursor_area(
@@ -447,7 +460,7 @@ fn enable() -> ImeRequest {
 
 /// Sends `request` to `window`, collecting its sync.
 fn request(window: &mut ImeWindow<Fake>, syncs: &mut Syncs, request: ImeRequest) -> Option<bool> {
-    window.request(request, 1.0, |fences| syncs.push(fences)).unwrap()
+    window.request(request, 1.0, |fences, disabled| syncs.push(Sync { fences, disabled })).unwrap()
 }
 
 /// An application's reset of a window's input method: a disable, then an enable.
@@ -456,11 +469,26 @@ fn reset(window: &mut ImeWindow<Fake>, syncs: &mut Syncs) {
     assert_eq!(request(window, syncs, enable()), Some(true));
 }
 
-/// The compositor's dispatch of the first sync still waiting, then the window's opening if it is
-/// due: whether it pushes the window's `Ime::Enabled`.
+/// The compositor's dispatch of the first sync still waiting: the window's events it pushes, in
+/// order — the `Ime::Disabled` a disable owed, if it is still due, then the window's opening, if
+/// it is due.
+fn dispatch(window: &mut ImeWindow<Fake>, syncs: &mut Syncs) -> Vec<Ime> {
+    let sync = syncs.remove(0);
+    retire(&sync.fences);
+    let mut events = Vec::new();
+    if sync.disabled.is_some_and(|owed| window.take_disabled(owed)) {
+        events.push(Ime::Disabled);
+    }
+    if window.take_opening() {
+        events.push(Ime::Enabled);
+    }
+    events
+}
+
+/// The compositor's dispatch of the first sync still waiting: whether it pushes the window's
+/// `Ime::Enabled`.
 fn callback(window: &mut ImeWindow<Fake>, syncs: &mut Syncs) -> bool {
-    retire(&syncs.remove(0));
-    window.take_opening()
+    dispatch(window, syncs).contains(&Ime::Enabled)
 }
 
 /// An enable sends no `Ime::Enabled` of its own: the window opens at the compositor's dispatch of
@@ -478,8 +506,8 @@ fn a_reset_opens_the_window_at_the_disables_callback() {
     reset(&mut window, &mut syncs);
     assert_eq!(a.requests(), ["disable", "commit", "enable", "cursor_rectangle", "commit"]);
     assert_eq!(syncs.len(), 2, "one sync per transition");
-    assert_eq!(syncs[0], [(a.clone(), 2)], "the disable's sync lists its fence");
-    assert!(syncs[1].is_empty());
+    assert_eq!(syncs[0].fences, [(a.clone(), 2)], "the disable's sync lists its fence");
+    assert!(syncs[1].fences.is_empty());
     assert!(!window.take_opening(), "the fence is not retired yet");
 
     assert!(callback(&mut window, &mut syncs), "the disable's callback opens the window");
@@ -523,7 +551,7 @@ fn one_sync_retires_every_member_and_opens_the_window_once() {
     assert!(!callback(&mut window, &mut syncs), "the entered window opened already");
 
     reset(&mut window, &mut syncs);
-    assert_eq!(syncs[0].len(), 2);
+    assert_eq!(syncs[0].fences.len(), 2);
     assert!(callback(&mut window, &mut syncs));
     assert_eq!((a.fence(), b.fence()), (None, None));
     assert!(!callback(&mut window, &mut syncs));
@@ -646,7 +674,7 @@ fn send(
         batch(data);
         data.commits
     });
-    window.done(member, serial, |fences| syncs.push(fences))
+    window.done(member, serial, reset_sync(syncs))
 }
 
 fn preedit(text: &str) -> impl FnOnce(&mut TextInputDataInner) + '_ {
@@ -768,7 +796,8 @@ fn a_takeover_ends_the_owners_composition_first() {
         assert_eq!(a.requests(), ["disable", "commit", "enable", "cursor_rectangle", "commit"]);
         assert!(b.requests().is_empty(), "the seat that took over is not reset");
         let fence = a.fence().expect("the displaced text input is fenced");
-        assert_eq!(syncs, [vec![(a.clone(), fence)]], "one sync, listing the displaced alone");
+        let reset = Sync { fences: vec![(a.clone(), fence)], disabled: None };
+        assert_eq!(syncs, [reset], "one sync, listing the displaced alone and owing nothing");
 
         assert!(!callback(&mut window, &mut syncs), "the reset owes no opening");
         assert_eq!(a.fence(), None);
@@ -787,7 +816,7 @@ fn the_displaced_composers_late_batch_is_dropped() {
     assert_eq!(send(&mut window, &mut syncs, b, preedit("x")), [cleared(), shown("x")]);
 
     a.with_data(commit("p"));
-    assert!(window.done(a, before_reset, |fences| syncs.push(fences)).is_empty());
+    assert!(window.done(a, before_reset, reset_sync(&mut syncs)).is_empty());
     assert_eq!(send(&mut window, &mut syncs, b, preedit("xy")), [shown("xy")], "B still owns it");
 }
 
@@ -845,4 +874,106 @@ fn a_disable_ends_the_ownership() {
     a.requests();
     assert_eq!(send(&mut window, &mut syncs, b, preedit("x")), [shown("x")]);
     assert!(a.requests().is_empty() && syncs.is_empty(), "no takeover");
+}
+
+/// A disable pushes nothing at the request: its `Ime::Disabled` comes at its own sync's callback,
+/// behind every batch the compositor sent before it applied the disable — a batch winit had
+/// already received when the request was made is delivered before it.
+#[test]
+fn a_disables_ime_disabled_comes_at_its_callback() {
+    let (mut window, mut syncs, members) = entered(1);
+    let a = &members[0];
+    assert_eq!(request(&mut window, &mut syncs, ImeRequest::Disable), Some(false));
+    assert_eq!(syncs.len(), 1, "the disable's sync");
+    assert!(syncs[0].disabled.is_some(), "it owes the window its `Ime::Disabled`");
+    a.requests();
+    assert_eq!(dispatch(&mut window, &mut syncs), [Ime::Disabled]);
+}
+
+/// A reset's two events come at one callback, the disable's: `Ime::Disabled`, then the opening.
+/// The compositor's answer to the disable (a batch at the disable's serial, which the enable lets
+/// through the fence) comes before both.
+#[test]
+fn a_reset_pushes_disabled_then_enabled_at_the_disables_callback() {
+    let (mut window, mut syncs, members) = entered(1);
+    let a = &members[0];
+    reset(&mut window, &mut syncs);
+    assert_eq!(send(&mut window, &mut syncs, a, commit("p")), [Ime::Commit("p".to_owned())]);
+    assert_eq!(dispatch(&mut window, &mut syncs), [Ime::Disabled, Ime::Enabled]);
+    assert!(dispatch(&mut window, &mut syncs).is_empty(), "the enable's callback pushes nothing");
+}
+
+/// The last member leaves between a disable and its callback: its removal pushes the window's
+/// `Ime::Disabled`, and the callback pushes no second one. After a reset whose member leaves and
+/// enters again before the callback, the `enter`'s `Ime::Enabled` opened the window, and the
+/// callback pushes neither event: an `Ime::Disabled` after it would contradict the enabled input
+/// method.
+#[test]
+fn a_leave_before_the_callback_takes_the_disables_place() {
+    let (mut window, mut syncs, members) = entered(1);
+    let a = &members[0];
+    request(&mut window, &mut syncs, ImeRequest::Disable);
+    let _ = a.with_data(|data| data.disable(a));
+    assert_eq!(window.remove(a), [Ime::Disabled]);
+    assert!(dispatch(&mut window, &mut syncs).is_empty(), "no second `Ime::Disabled`");
+
+    let (mut window, mut syncs, members) = entered(1);
+    let a = &members[0];
+    reset(&mut window, &mut syncs);
+    let _ = a.with_data(|data| data.disable(a));
+    assert_eq!(window.remove(a), [Ime::Disabled], "the teardown");
+    assert!(window.enter(a), "the `enter` opens the window again");
+    for _ in 0..2 {
+        assert!(dispatch(&mut window, &mut syncs).is_empty(), "no event after the `enter`'s");
+    }
+}
+
+/// Two disables before the first callback owe one `Ime::Disabled`, at the first callback; a
+/// disable with no text input entered, as on a compositor without text-input-v3, still pushes it,
+/// with no `Ime::Enabled` before it.
+#[test]
+fn disables_before_a_callback_push_one_disabled() {
+    let (mut window, mut syncs, _members) = entered(1);
+    request(&mut window, &mut syncs, ImeRequest::Disable);
+    request(&mut window, &mut syncs, ImeRequest::Disable);
+    assert_eq!(dispatch(&mut window, &mut syncs), [Ime::Disabled]);
+    assert!(dispatch(&mut window, &mut syncs).is_empty());
+
+    let (mut window, mut syncs) = (ImeWindow::<Fake>::default(), Syncs::new());
+    request(&mut window, &mut syncs, enable());
+    assert!(
+        dispatch(&mut window, &mut syncs).is_empty(),
+        "no text input entered: no `Ime::Enabled`"
+    );
+    request(&mut window, &mut syncs, ImeRequest::Disable);
+    assert_eq!(dispatch(&mut window, &mut syncs), [Ime::Disabled]);
+}
+
+/// The sync holds its window weakly: a window destroyed before the callback gets no
+/// `Ime::Disabled`, and a live one gets it once. Each window is the input method a
+/// `WindowState` holds.
+#[test]
+fn a_destroyed_window_gets_no_disabled() {
+    let id = WindowId::from_raw(1);
+    let live = std::sync::Arc::new(Mutex::new(ImeWindow::<ZwpTextInputV3>::default()));
+    let owed = {
+        let mut window = live.lock().unwrap();
+        let mut owed = None;
+        window.request(ImeRequest::Disable, 1.0, |_, disabled| owed = disabled).unwrap();
+        owed.expect("a disable owes its window its `Ime::Disabled`")
+    };
+    let pending = PendingDisabled::new(id, std::sync::Arc::downgrade(&live), owed);
+    assert_eq!(pending.due(), Some(id));
+    assert_eq!(pending.due(), None, "once");
+
+    let gone = std::sync::Arc::new(Mutex::new(ImeWindow::<ZwpTextInputV3>::default()));
+    let owed = {
+        let mut window = gone.lock().unwrap();
+        let mut owed = None;
+        window.request(ImeRequest::Disable, 1.0, |_, disabled| owed = disabled).unwrap();
+        owed.expect("a disable owes its window its `Ime::Disabled`")
+    };
+    let pending = PendingDisabled::new(id, std::sync::Arc::downgrade(&gone), owed);
+    drop(gone);
+    assert_eq!(pending.due(), None, "the window is gone");
 }

@@ -8,14 +8,13 @@ use wayland_client::Proxy;
 use wayland_client::protocol::wl_display::WlDisplay;
 use winit_core::cursor::Cursor;
 use winit_core::error::RequestError;
-use winit_core::event::{Ime, WindowEvent};
 use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{
     CursorGrabMode, ImeCapabilities, ImeRequest, ImeRequestError, ResizeDirection, Theme,
     UserAttentionType, WindowId, WindowLevel,
 };
 
-use crate::seat::ImeSync;
+use crate::seat::{ImeSync, PendingDisabled};
 use crate::window::Handles;
 use crate::window::state::WindowState;
 
@@ -191,21 +190,21 @@ impl WindowCommon {
     #[inline]
     pub(crate) fn request_ime_update(&self, request: ImeRequest) -> Result<(), ImeRequestError> {
         let Some(s) = self.state.upgrade() else { return Ok(()) };
-        let state_changed = s.lock().unwrap().request_ime_update(request, |fences| {
-            ImeSync::send(&self.display, &self.handles.queue_handle, fences)
+        let state_changed = s.lock().unwrap().request_ime_update(request, |fences, owed| {
+            let disabled =
+                owed.map(|owed| PendingDisabled::new(self.window_id, self.state.clone(), owed));
+            ImeSync::send(&self.display, &self.handles.queue_handle, fences, disabled)
         })?;
 
-        // The `Ime::Enabled` of an enable is the window's opening, which the compositor's dispatch
-        // pushes once every batch from before the window's latest disables has arrived. Pushed
-        // here, into the window's own sink, it would be delivered ahead of the compositor's events
-        // already received in this iteration.
-        match state_changed {
-            Some(false) => {
-                self.handles.push_window_event(WindowEvent::Ime(Ime::Disabled), self.window_id)
-            },
-            // Wake the loop, which flushes the requests and dispatches the sync's callback.
-            Some(true) => self.handles.event_loop_awakener.ping(),
-            None => (),
+        // Both events of a transition come from the compositor's dispatch: the `Ime::Enabled` of an
+        // enable is the window's opening, pushed once every batch from before the window's latest
+        // disables has arrived, and the `Ime::Disabled` of a disable is pushed at its sync's
+        // callback, behind every batch the compositor sent before it applied the disable. Pushed
+        // here, into the window's own sink, either would be delivered ahead of the compositor's
+        // events already received in this iteration. Wake the loop, which flushes the requests and
+        // dispatches the sync's callback.
+        if state_changed.is_some() {
+            self.handles.event_loop_awakener.ping();
         }
 
         Ok(())

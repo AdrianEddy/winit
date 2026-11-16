@@ -7,11 +7,9 @@ use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
 use tracing::warn;
 use winit_core::error::RequestError;
-use winit_core::event::WindowEvent;
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
-use winit_core::window::{UserAttentionType, WindowId};
+use winit_core::window::UserAttentionType;
 
-use super::super::event_loop::sink::EventSink;
 use super::super::output::MonitorHandle;
 use super::super::state::WinitState;
 use super::super::types::xdg_activation::XdgActivationTokenData;
@@ -29,9 +27,6 @@ pub struct Handles {
 
     /// Source to wake-up the event-loop for window requests.
     pub(crate) event_loop_awakener: calloop::ping::Ping,
-
-    /// The event sink to deliver synthetic events.
-    pub(crate) window_events_sink: Arc<Mutex<EventSink>>,
 
     /// Xdg activation to request user attention.
     pub(crate) xdg_activation: Option<XdgActivationV1>,
@@ -57,11 +52,6 @@ impl Handles {
         {
             self.event_loop_awakener.ping();
         }
-    }
-
-    pub(crate) fn push_window_event(&self, event: WindowEvent, id: WindowId) {
-        self.window_events_sink.lock().unwrap().push_window_event(event, id);
-        self.event_loop_awakener.ping();
     }
 
     pub(crate) fn available_monitors(&self) -> Box<dyn Iterator<Item = CoreMonitorHandle>> {

@@ -1,4 +1,5 @@
 use std::ops::Deref;
+use std::sync::{Mutex, Weak};
 
 use dpi::{LogicalPosition, LogicalSize};
 use sctk::globals::GlobalData;
@@ -14,14 +15,15 @@ use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::
 use tracing::warn;
 use winit_core::event::{Ime, WindowEvent};
 use winit_core::window::{
-    ImeCapabilities, ImeHint, ImePurpose, ImeRequestData, ImeSurroundingText,
+    ImeCapabilities, ImeHint, ImePurpose, ImeRequestData, ImeSurroundingText, WindowId,
 };
 
 use crate::state::WinitState;
+use crate::window::WindowState;
 
 mod window;
 
-pub use window::ImeWindow;
+pub use window::{ImeWindow, OwedDisabled, TakeDisabled};
 
 #[derive(Debug)]
 pub struct TextInputState {
@@ -99,7 +101,7 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                     // Always issue a disable.
                     text_input_data.disable(text_input)
                 };
-                ImeSync::send(&conn.display(), qhandle, vec![(text_input.clone(), fence)]);
+                ImeSync::send(&conn.display(), qhandle, vec![(text_input.clone(), fence)], None);
 
                 let window_id = crate::make_wid(&surface);
 
@@ -138,7 +140,7 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 let events = match windows.get(&window_id) {
                     Some(window) => {
                         window.lock().unwrap().text_input_done(text_input, serial, |fences| {
-                            ImeSync::send(&conn.display(), qhandle, fences)
+                            ImeSync::send(&conn.display(), qhandle, fences, None)
                         })
                     },
                     // A surface the event loop holds no window for: its batch is delivered as it
@@ -168,23 +170,54 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
 /// The compositor handles a connection's requests in order and sends a connection's events in
 /// order, so the callback follows every event the compositor sent before it applied the requests
 /// ahead of the sync: every batch a listed text input's compositor-side state produced before its
-/// disable. The callback retires those fences — each only if no later disable replaced it — and
-/// opens the windows whose text inputs are all ready (`ImeWindow::take_opening`).
+/// disable. The callback retires those fences — each only if no later disable replaced it — pushes
+/// the `Ime::Disabled` an application's disable owes its window, and then opens the windows whose
+/// text inputs are all ready (`ImeWindow::take_opening`).
 #[derive(Debug)]
 pub struct ImeSync {
     /// The text inputs the transition disabled, each with its fence.
     fences: Vec<(ZwpTextInputV3, u32)>,
+    /// The `Ime::Disabled` an application's disable owes its window.
+    disabled: Option<PendingDisabled>,
 }
 
 impl ImeSync {
     /// Sends the sync of a transition that disabled the `fences`' text inputs (none for an
-    /// enable).
+    /// enable), and, for an application's disable, owes its window `disabled`.
     pub fn send(
         display: &WlDisplay,
         queue_handle: &QueueHandle<WinitState>,
         fences: Vec<(ZwpTextInputV3, u32)>,
+        disabled: Option<PendingDisabled>,
     ) {
-        display.sync(queue_handle, ImeSync { fences });
+        display.sync(queue_handle, ImeSync { fences, disabled });
+    }
+}
+
+/// The `Ime::Disabled` an application's disable request owes its window, pushed at the callback of
+/// the request's sync: behind every batch the compositor sent before it applied the disable, and
+/// ahead of the opening of the enable that follows it in a reset.
+///
+/// The window is held weakly: one destroyed before the callback gets nothing, nor one created since
+/// with the same id (a window's id is its surface's address, which a later surface can reuse).
+#[derive(Debug)]
+pub struct PendingDisabled<W = WindowState> {
+    window_id: WindowId,
+    window: Weak<Mutex<W>>,
+    owed: OwedDisabled,
+}
+
+impl<W: TakeDisabled> PendingDisabled<W> {
+    pub fn new(window_id: WindowId, window: Weak<Mutex<W>>, owed: OwedDisabled) -> Self {
+        Self { window_id, window, owed }
+    }
+
+    /// At the sync's callback: the window whose `Ime::Disabled` is pushed now, if the window still
+    /// exists and still owes it (`ImeWindow::take_disabled`).
+    fn due(&self) -> Option<WindowId> {
+        let window = self.window.upgrade()?;
+        let due = window.lock().unwrap().take_disabled(self.owed);
+        due.then_some(self.window_id)
     }
 }
 
@@ -199,6 +232,9 @@ impl Dispatch<WlCallback, ImeSync, WinitState> for TextInputState {
     ) {
         if let wl_callback::Event::Done { .. } = event {
             retire(&data.fences);
+            if let Some(window_id) = data.disabled.as_ref().and_then(PendingDisabled::due) {
+                state.events_sink.push_window_event(WindowEvent::Ime(Ime::Disabled), window_id);
+            }
             state.open_ime_windows();
         }
     }

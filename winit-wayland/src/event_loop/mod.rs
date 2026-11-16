@@ -440,22 +440,7 @@ impl EventLoop {
             }
         }
 
-        // Push the events directly from the window.
-        self.with_state(|state| {
-            buffer_sink.append(&mut state.window_events_sink.lock().unwrap());
-        });
-        for event in buffer_sink.drain() {
-            match event {
-                Event::WindowEvent { window_id, event } => {
-                    app.window_event(&self.active_event_loop, window_id, event)
-                },
-                Event::DeviceEvent { event } => {
-                    app.device_event(&self.active_event_loop, None, event)
-                },
-            }
-        }
-
-        // Handle non-synthetic events.
+        // Deliver the events the dispatch pushed, in the order it pushed them.
         self.with_state(|state| {
             buffer_sink.append(&mut state.events_sink);
         });

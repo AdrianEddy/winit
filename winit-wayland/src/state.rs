@@ -73,9 +73,6 @@ pub struct WinitState {
     /// The requests from the `Window` to EventLoop, such as close operations and redraw requests.
     pub window_requests: RefCell<HashMap<WindowId, Arc<WindowRequests>>>,
 
-    /// The events that were generated directly from the window.
-    pub window_events_sink: Arc<Mutex<EventSink>>,
-
     /// The update for the `windows` coming from the compositor.
     pub window_compositor_updates: Vec<WindowCompositorUpdate>,
 
@@ -230,7 +227,6 @@ impl WinitState {
             windows: Default::default(),
             window_requests: Default::default(),
             window_compositor_updates: Vec::new(),
-            window_events_sink: Default::default(),
             viewporter_state,
             data_device_manager_state,
             primary_selection_manager_state,

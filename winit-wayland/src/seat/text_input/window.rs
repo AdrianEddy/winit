@@ -17,6 +17,11 @@ use super::{ClientState, TextInputHandle};
 /// two seats' input methods into one composition. The window's `Ime::Enabled` and `Ime::Disabled`
 /// follow its first and its last member, so one seat's `leave` never ends what another seat's
 /// input method is composing.
+///
+/// Both events are pushed from the compositor's dispatch, never at a request: an enable's
+/// `Ime::Enabled` once every batch from before the window's latest disables has arrived
+/// (`take_opening`), and a disable's `Ime::Disabled` at its own sync's callback
+/// (`take_disabled`), behind every batch the compositor sent before it applied the disable.
 #[derive(Debug)]
 pub struct ImeWindow<T> {
     /// The input method properties provided by the application to the IME, `None` while it is
@@ -34,12 +39,34 @@ pub struct ImeWindow<T> {
 
     /// The member whose composition the window shows.
     composing: Option<T>,
+
+    /// The number of `Ime::Enabled` and `Ime::Disabled` events pushed for the window: a disable's
+    /// `Ime::Disabled` is due at its callback only while none was pushed since the request.
+    events_pushed: u64,
 }
 
 impl<T> Default for ImeWindow<T> {
     fn default() -> Self {
-        Self { state: None, members: Vec::new(), opening_owed: false, composing: None }
+        Self {
+            state: None,
+            members: Vec::new(),
+            opening_owed: false,
+            composing: None,
+            events_pushed: 0,
+        }
     }
+}
+
+/// The `Ime::Disabled` a disable request owes its window, pushed at the request's sync callback
+/// (`ImeWindow::take_disabled`): the window's count of pushed `Ime::Enabled` and `Ime::Disabled`
+/// events at the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwedDisabled(u64);
+
+/// What a disable request's sync asks of its window at the callback: whether the `Ime::Disabled`
+/// the request owed it is pushed now.
+pub trait TakeDisabled {
+    fn take_disabled(&mut self, owed: OwedDisabled) -> bool;
 }
 
 impl<T: TextInputHandle> ImeWindow<T> {
@@ -52,16 +79,17 @@ impl<T: TextInputHandle> ImeWindow<T> {
     ///
     /// A request that enables or disables the input method is a transition, and `sync` sends its
     /// `wl_display.sync`: after the disables, listing them with their fences, or before the
-    /// enables. No `Ime::Enabled` is pushed here: an enable owes the window its opening, which the
+    /// enables. No event is pushed here. An enable owes the window its opening, which the
     /// compositor's dispatch pushes, behind every event the compositor sent before it applied the
-    /// window's latest disables (`take_opening`).
+    /// window's latest disables (`take_opening`). A disable owes the window its `Ime::Disabled`,
+    /// which the callback of the disable's own sync pushes (`take_disabled`): `sync` carries it.
     ///
     /// Returns `None` if the input method state did not change, or `Some(allowed)` otherwise.
     pub fn request(
         &mut self,
         request: ImeRequest,
         scale_factor: f64,
-        sync: impl FnOnce(Vec<(T, u32)>),
+        sync: impl FnOnce(Vec<(T, u32)>, Option<OwedDisabled>),
     ) -> Result<Option<bool>, ImeRequestError> {
         let state_change = match request {
             ImeRequest::Enable(enable) => {
@@ -97,7 +125,7 @@ impl<T: TextInputHandle> ImeWindow<T> {
                 Ok(None)
             },
             (Some(state), true) => {
-                sync(Vec::new());
+                sync(Vec::new(), None);
                 self.opening_owed = true;
                 for member in &self.members {
                     member.with_data(|data| data.set_state(member, state, true));
@@ -112,7 +140,7 @@ impl<T: TextInputHandle> ImeWindow<T> {
                     .collect();
                 self.opening_owed = false;
                 self.composing = None;
-                sync(fences);
+                sync(fences, Some(OwedDisabled(self.events_pushed)));
                 Ok(Some(false))
             },
         }
@@ -134,6 +162,7 @@ impl<T: TextInputHandle> ImeWindow<T> {
             return false;
         }
         self.opening_owed = false;
+        self.events_pushed += 1;
         true
     }
 
@@ -161,6 +190,7 @@ impl<T: TextInputHandle> ImeWindow<T> {
         }
         if self.members.is_empty() {
             events.push(Ime::Disabled);
+            self.events_pushed += 1;
         }
         events
     }
@@ -240,7 +270,26 @@ impl<T: TextInputHandle> ImeWindow<T> {
         }
         if ready {
             self.opening_owed = false;
+            self.events_pushed += 1;
         }
         ready
+    }
+}
+
+impl<T> TakeDisabled for ImeWindow<T> {
+    /// Whether the window's `Ime::Disabled` that a disable request owed (`owed`, from `request`)
+    /// is pushed now, at that request's sync callback, ahead of any opening the callback pushes.
+    ///
+    /// It is due unless the window pushed an `Ime::Enabled` or an `Ime::Disabled` since the
+    /// request: the last member's removal already told the application, or a member's `enter`
+    /// opened the window again, and an `Ime::Disabled` after that `Ime::Enabled` would contradict
+    /// an input method that is enabled. So a window's events alternate, and two disables before the
+    /// first callback push one.
+    fn take_disabled(&mut self, owed: OwedDisabled) -> bool {
+        if owed.0 != self.events_pushed {
+            return false;
+        }
+        self.events_pushed += 1;
+        true
     }
 }

@@ -3,6 +3,7 @@ use winit_core::event::Ime;
 use winit_core::window::{ImeCapabilities, ImeRequest, ImeRequestError};
 
 use super::WindowState;
+use crate::seat::{OwedDisabled, TakeDisabled};
 
 impl WindowState {
     /// Whether the IME is allowed.
@@ -14,14 +15,15 @@ impl WindowState {
     /// Atomically update input method state.
     ///
     /// A request that enables or disables the input method sends one `wl_display.sync` through
-    /// `sync`, with the fences of the text inputs it disabled (`ImeWindow::request`).
+    /// `sync`, with the fences of the text inputs it disabled and, for a disable, the
+    /// `Ime::Disabled` it owes the window (`ImeWindow::request`).
     ///
     /// Returns `None` if an input method state haven't changed. Alternatively `Some(true)` and
     /// `Some(false)` is returned respectfully.
     pub fn request_ime_update(
         &mut self,
         request: ImeRequest,
-        sync: impl FnOnce(Vec<(ZwpTextInputV3, u32)>),
+        sync: impl FnOnce(Vec<(ZwpTextInputV3, u32)>, Option<OwedDisabled>),
     ) -> Result<Option<bool>, ImeRequestError> {
         let scale_factor = self.scale_factor();
         self.ime.request(request, scale_factor, sync)
@@ -56,5 +58,13 @@ impl WindowState {
     /// (`ImeWindow::take_opening`).
     pub(crate) fn take_ime_opening(&mut self) -> bool {
         self.ime.take_opening()
+    }
+}
+
+impl TakeDisabled for WindowState {
+    /// Whether the `Ime::Disabled` a disable request owed the window is pushed now
+    /// (`ImeWindow::take_disabled`).
+    fn take_disabled(&mut self, owed: OwedDisabled) -> bool {
+        self.ime.take_disabled(owed)
     }
 }

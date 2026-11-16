@@ -34,7 +34,9 @@ pub use pointer::pointer_gesture::{PointerGestureData, PointerGesturesState};
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 use text_input::TextInputData;
-pub use text_input::{ImeSync, ImeWindow, TextInputState};
+pub use text_input::{
+    ImeSync, ImeWindow, OwedDisabled, PendingDisabled, TakeDisabled, TextInputState,
+};
 use touch::TouchPoint;
 
 #[derive(Debug, Default)]

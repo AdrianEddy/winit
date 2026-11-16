@@ -183,9 +183,6 @@ impl Window {
         let window_requests = Arc::new(window_requests);
         state.window_requests.get_mut().insert(window_id, window_requests.clone());
 
-        // Setup the event sync to insert `WindowEvents` right from the window.
-        let window_events_sink = state.window_events_sink.clone();
-
         let mut wayland_source = event_loop_window_target.wayland_dispatcher.as_source_mut();
         let event_queue = wayland_source.queue();
 
@@ -215,7 +212,6 @@ impl Window {
                     window_requests,
                     monitors,
                     event_loop_awakener,
-                    window_events_sink,
 
                     compositor,
 
