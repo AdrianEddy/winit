@@ -32,6 +32,7 @@ use super::event::{
     code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
     scancode_to_physicalkey,
 };
+use super::key_interpretation::ViewIdentity;
 use super::window::window_id;
 use crate::OptionAsAlt;
 
@@ -282,6 +283,7 @@ define_class!(
                 tracing::debug!("ignoring setMarkedText: sent while the marked text is discarded");
                 return;
             }
+            self.composition_answer();
 
             let (marked_text, string) = if let Some(string) =
                 string.downcast_ref::<NSAttributedString>()
@@ -341,6 +343,7 @@ define_class!(
                 tracing::debug!("ignoring unmarkText sent while the marked text is discarded");
                 return;
             }
+            self.composition_answer();
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
             let input_context = self.inputContext().expect("input context");
@@ -424,6 +427,10 @@ define_class!(
             let has_marked = self.hasMarkedText();
             let pending_commit = self.ivars().pending_commit.get();
             let ime_enabled = self.is_ime_enabled();
+            if has_marked || pending_commit {
+                // The text ends this view's composition.
+                self.composition_answer();
+            }
 
             // Only commit via IME if there was a real composition session.
             // Some IMEs send insertText for all typing (e.g. spaces, English chars)
@@ -503,9 +510,17 @@ define_class!(
             // we must send the `KeyboardInput` event during IME if it triggered
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
+            let mut composed_elsewhere = false;
             if self.ivars().ime_capabilities.get().is_some() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                // The text input system answers the client of the activated input context, which
+                // need not be this view (see `KeyInterpretation`). A key it answered with another
+                // view's composition belongs to that composition, and is no key press of this view.
+                let interpreting =
+                    self.ivars().app_state.key_interpretation().begin(ViewIdentity::of(self));
                 self.interpretKeyEvents(&events_for_nsview);
+                composed_elsewhere = interpreting.composed_elsewhere();
+                drop(interpreting);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -525,7 +540,7 @@ define_class!(
                 ImeState::Preedit => true,
                 // `key_down` could result in preedit clear, so compare old and current state.
                 _ => old_ime_state != self.ivars().ime_state.get(),
-            };
+            } || composed_elsewhere;
 
             if !had_ime_input || self.ivars().forward_key_to_app.get() {
                 let key_event = create_key_event(&event, true, event.isARepeat());
@@ -1093,6 +1108,11 @@ impl WinitView {
             self.ivars().ime_state.set(ImeState::Ground);
         }
         self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+    }
+
+    /// The text input system answered this view with a composition (`KeyInterpretation`).
+    fn composition_answer(&self) {
+        self.ivars().app_state.key_interpretation().composition_answer(ViewIdentity::of(self));
     }
 
     /// Tell the view's input context to discard its marked text, and ignore what the input

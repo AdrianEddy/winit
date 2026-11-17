@@ -21,6 +21,7 @@ use super::event_loop::{ActiveEventLoop, notify_windows_of_exit, stop_app_immedi
 use super::menu;
 use super::observer::EventLoopWaker;
 use crate::data_transfer::DataTransferState;
+use crate::key_interpretation::KeyInterpretation;
 use crate::window_delegate::WindowDelegate;
 
 #[derive(Debug)]
@@ -49,6 +50,8 @@ pub(super) struct AppState {
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
     windows: RefCell<HashMap<WindowId, MainThreadBound<Weak<WindowDelegate>>>>,
+    /// The key event a view is interpreting, shared by every view (`KeyInterpretation`).
+    key_interpretation: KeyInterpretation,
     // NOTE: This is strongly referenced by our `NSWindowDelegate` and our `NSView` subclass, and
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
@@ -91,6 +94,7 @@ impl AppState {
             wait_timeout: Cell::new(None),
             windows: Default::default(),
             pending_redraw: RefCell::new(vec![]),
+            key_interpretation: KeyInterpretation::default(),
         });
 
         GLOBAL.get(mtm).set(this.clone()).ok().and(Some(this))
@@ -256,6 +260,11 @@ impl AppState {
 
     pub fn set_control_flow(&self, value: ControlFlow) {
         self.control_flow.set(value)
+    }
+
+    /// The key event a view is interpreting, and the compositions other views answered it with.
+    pub(super) fn key_interpretation(&self) -> &KeyInterpretation {
+        &self.key_interpretation
     }
 
     pub(super) fn is_handling_event(&self) -> bool {

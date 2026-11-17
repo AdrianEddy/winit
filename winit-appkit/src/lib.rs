@@ -76,6 +76,7 @@ mod data_transfer;
 mod event;
 mod event_loop;
 mod ffi;
+mod key_interpretation;
 mod menu;
 mod monitor;
 mod observer;
