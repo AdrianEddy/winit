@@ -114,6 +114,8 @@ impl ImeContext {
     }
 
     pub unsafe fn set_ime_cursor_area(&self, spot: Position, size: Size, scale_factor: f64) {
+        #[cfg(test)]
+        imm_call_hook::call();
         if !unsafe { ImeContext::system_has_ime() } {
             return;
         }
@@ -140,6 +142,8 @@ impl ImeContext {
     }
 
     pub unsafe fn set_ime_allowed(hwnd: HWND, allowed: bool) {
+        #[cfg(test)]
+        imm_call_hook::call();
         if !unsafe { ImeContext::system_has_ime() } {
             return;
         }
@@ -159,5 +163,27 @@ impl ImeContext {
 impl Drop for ImeContext {
     fn drop(&mut self) {
         unsafe { ImmReleaseContext(self.hwnd, self.himc) };
+    }
+}
+
+/// A hook the unit tests run as each IMM call that an IME may answer synchronously begins.
+#[cfg(test)]
+pub(crate) mod imm_call_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: Option<Box<dyn Fn()>>) {
+        HOOK.with_borrow_mut(|slot| *slot = hook);
+    }
+
+    pub(super) fn call() {
+        HOOK.with_borrow(|hook| {
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
     }
 }

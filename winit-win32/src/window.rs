@@ -1090,43 +1090,7 @@ impl CoreWindow for Window {
         let window = self.window;
         let state = self.window_state.clone();
         self.thread_executor.execute_in_thread(move || unsafe {
-            let hwnd = window.hwnd();
-            let mut state = state.lock().unwrap();
-            let (capabilities, request_data) = match &request {
-                ImeRequest::Enable(enable) => {
-                    let capabilities = *enable.capabilities();
-                    state.ime_capabilities = Some(capabilities);
-                    ImeContext::set_ime_allowed(hwnd, true);
-                    (capabilities, enable.request_data())
-                },
-                ImeRequest::Update(request_data) => {
-                    if let Some(capabilities) = state.ime_capabilities {
-                        (capabilities, request_data)
-                    } else {
-                        warn!("ime update without IME enabled.");
-                        return;
-                    }
-                },
-                ImeRequest::Disable => {
-                    state.ime_capabilities = None;
-                    ImeContext::set_ime_allowed(window.hwnd(), false);
-                    return;
-                },
-                _ => return,
-            };
-
-            if let Some((spot, size)) = request_data.cursor_area {
-                if capabilities.cursor_area() {
-                    let scale_factor = state.scale_factor;
-                    ImeContext::current(window.hwnd()).set_ime_cursor_area(
-                        spot,
-                        size,
-                        scale_factor,
-                    );
-                } else {
-                    warn!("discarding IME cursor area update without capability enabled.");
-                }
-            }
+            apply_ime_request(window.hwnd(), &state, &request);
         });
 
         Ok(())
@@ -1859,4 +1823,122 @@ unsafe fn force_window_active(handle: HWND) {
     unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), mem::size_of::<INPUT>() as i32) };
 
     unsafe { SetForegroundWindow(handle) };
+}
+
+/// Applies an IME request to the window's state, then to its input context.
+///
+/// The state's lock is released before any IMM call. An IME may answer an association change
+/// or a placement synchronously, with `WM_IME_*` messages whose handlers lock the same state.
+unsafe fn apply_ime_request(hwnd: HWND, state: &Mutex<WindowState>, request: &ImeRequest) {
+    let (capabilities, request_data, scale_factor) = {
+        let mut state = state.lock().unwrap();
+        match request {
+            ImeRequest::Enable(enable) => {
+                let capabilities = *enable.capabilities();
+                state.ime_capabilities = Some(capabilities);
+                (capabilities, enable.request_data(), state.scale_factor)
+            },
+            ImeRequest::Update(request_data) => match state.ime_capabilities {
+                Some(capabilities) => (capabilities, request_data, state.scale_factor),
+                None => {
+                    warn!("ime update without IME enabled.");
+                    return;
+                },
+            },
+            ImeRequest::Disable => {
+                state.ime_capabilities = None;
+                drop(state);
+                unsafe { ImeContext::set_ime_allowed(hwnd, false) };
+                return;
+            },
+            _ => return,
+        }
+    };
+
+    if let ImeRequest::Enable(_) = request {
+        unsafe { ImeContext::set_ime_allowed(hwnd, true) };
+    }
+
+    if let Some((spot, size)) = request_data.cursor_area {
+        if capabilities.cursor_area() {
+            unsafe { ImeContext::current(hwnd).set_ime_cursor_area(spot, size, scale_factor) };
+        } else {
+            warn!("discarding IME cursor area update without capability enabled.");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::ptr;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    use dpi::{LogicalPosition, LogicalSize};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, HWND_MESSAGE,
+    };
+    use winit_core::window::{
+        ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData, Theme, WindowAttributes,
+    };
+
+    use super::apply_ime_request;
+    use crate::ime::imm_call_hook;
+    use crate::window_state::WindowState;
+    use crate::{WindowAttributesWindows, util};
+
+    /// An IME may answer an IMM call synchronously with `WM_IME_*` messages, whose handlers lock
+    /// the window's state, so no request may hold that lock across one.
+    #[test]
+    fn ime_requests_release_the_window_state_before_each_imm_call() {
+        // A message-only window, which gets no messages unless they are sent to it.
+        let class = util::encode_wide("STATIC");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                ptr::null_mut(),
+                util::get_instance_handle(),
+                ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let state = Arc::new(Mutex::new(WindowState::new(
+            &WindowAttributes::default(),
+            &WindowAttributesWindows::default(),
+            1.0,
+            Theme::Light,
+            None,
+        )));
+        // Whether the state was free as each IMM call began.
+        let free = Rc::new(RefCell::new(Vec::new()));
+        let (hook_state, hook_free) = (state.clone(), free.clone());
+        imm_call_hook::set(Some(Box::new(move || {
+            hook_free.borrow_mut().push(hook_state.try_lock().is_ok())
+        })));
+
+        let capabilities = ImeCapabilities::new().with_cursor_area();
+        let data = ImeRequestData::default()
+            .with_cursor_area(LogicalPosition::new(10, 20).into(), LogicalSize::new(2, 16).into());
+        let enable = ImeEnableRequest::new(capabilities, data.clone()).unwrap();
+        unsafe { apply_ime_request(hwnd, &state, &ImeRequest::Enable(enable)) };
+        assert_eq!(state.lock().unwrap().ime_capabilities, Some(capabilities));
+        unsafe { apply_ime_request(hwnd, &state, &ImeRequest::Update(data)) };
+        unsafe { apply_ime_request(hwnd, &state, &ImeRequest::Disable) };
+        assert_eq!(state.lock().unwrap().ime_capabilities, None);
+
+        imm_call_hook::set(None);
+        unsafe { DestroyWindow(hwnd) };
+        // The enable's association and cursor area, the update's cursor area, the disable's
+        // association.
+        assert_eq!(*free.borrow(), [true; 4]);
+    }
 }
